@@ -36,7 +36,9 @@ export async function initDb() {
       dsgvo_version TEXT,
       user_role TEXT NOT NULL DEFAULT 'user',
       level_role TEXT NOT NULL DEFAULT 'Rookie',
-      last_name_change TEXT
+      last_name_change TEXT,
+      game_daily_date TEXT,
+      game_daily_profit INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS friends (
@@ -71,7 +73,31 @@ export async function initDb() {
       accepted_at TEXT NOT NULL,
       version TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS characters (
+      user_id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      health INTEGER NOT NULL DEFAULT 100,
+      hunger INTEGER NOT NULL DEFAULT 0,
+      last_work TEXT,
+      last_feed TEXT,
+      last_tick TEXT,
+      created_at TEXT NOT NULL,
+      rename_count INTEGER NOT NULL DEFAULT 0,
+      last_maintenance TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS bans (
+      user_id TEXT PRIMARY KEY,
+      reason TEXT,
+      expires_at TEXT,
+      created_at TEXT NOT NULL,
+      created_by TEXT NOT NULL
+    );
   `);
+
+  // Ensure unique constraint for upserts
+  await db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_quests_key ON quests(key)");
 
   await ensureUserColumns(db);
   await seedQuests(db);
@@ -96,68 +122,103 @@ async function ensureUserColumns(db) {
   if (!names.has("last_name_change")) {
     await db.exec("ALTER TABLE users ADD COLUMN last_name_change TEXT");
   }
+  if (!names.has("game_daily_date")) {
+    await db.exec("ALTER TABLE users ADD COLUMN game_daily_date TEXT");
+  }
+  if (!names.has("game_daily_profit")) {
+    await db.exec("ALTER TABLE users ADD COLUMN game_daily_profit INTEGER NOT NULL DEFAULT 0");
+  }
 }
 
 async function seedQuests(db) {
-  const row = await db.get("SELECT COUNT(*) as c FROM quests");
-  if (row?.c > 0) return;
-
-  const seed = [
+  const quests = [
     {
-      key: "daily_play_3",
-      title: "Spiele 3 Runden",
+      key: "daily_work_1",
+      title: "Arbeite 1x",
       period: "daily",
-      target: 3,
+      target: 1,
       reward_phn: 120,
-      reward_xp: 60,
+      reward_xp: 80,
     },
     {
-      key: "daily_win_1",
-      title: "Gewinne 1 Runde",
+      key: "daily_feed_1",
+      title: "Fuehre 1x Essen/Medizin aus",
       period: "daily",
       target: 1,
       reward_phn: 90,
-      reward_xp: 50,
+      reward_xp: 70,
     },
     {
-      key: "daily_duel_1",
-      title: "Bestreite 1 Duell",
+      key: "daily_keep_health",
+      title: "Gesundheit >= 80 halten",
       period: "daily",
       target: 1,
       reward_phn: 110,
-      reward_xp: 60,
+      reward_xp: 90,
     },
     {
-      key: "weekly_play_20",
-      title: "Spiele 20 Runden",
-      period: "weekly",
-      target: 20,
-      reward_phn: 600,
-      reward_xp: 350,
+      key: "daily_hunger_low",
+      title: "Hunger unter 30 halten",
+      period: "daily",
+      target: 1,
+      reward_phn: 100,
+      reward_xp: 80,
     },
     {
-      key: "weekly_win_5",
-      title: "Gewinne 5 Runden",
+      key: "weekly_work_5",
+      title: "Arbeite 5x",
       period: "weekly",
       target: 5,
       reward_phn: 500,
       reward_xp: 300,
     },
     {
-      key: "progress_level_5",
-      title: "Erreiche Level 5",
-      period: "progress",
+      key: "weekly_feed_5",
+      title: "Fuehre 5x Essen/Medizin aus",
+      period: "weekly",
       target: 5,
-      reward_phn: 800,
+      reward_phn: 450,
+      reward_xp: 280,
+    },
+    {
+      key: "monthly_work_20",
+      title: "Arbeite 20x",
+      period: "monthly",
+      target: 20,
+      reward_phn: 1800,
+      reward_xp: 900,
+    },
+    {
+      key: "monthly_feed_20",
+      title: "Fuehre 20x Essen/Medizin aus",
+      period: "monthly",
+      target: 20,
+      reward_phn: 1600,
+      reward_xp: 850,
+    },
+    {
+      key: "progress_age_30",
+      title: "Erreiche Alter 30",
+      period: "progress",
+      target: 30,
+      reward_phn: 900,
       reward_xp: 0,
     },
   ];
 
   await db.exec("BEGIN");
   try {
-    for (const q of seed) {
+    for (const q of quests) {
       await db.run(
-        "INSERT INTO quests (key, title, period, target, reward_phn, reward_xp) VALUES (?, ?, ?, ?, ?, ?)",
+        `INSERT INTO quests (key, title, period, target, reward_phn, reward_xp, active)
+         VALUES (?, ?, ?, ?, ?, ?, 1)
+         ON CONFLICT(key) DO UPDATE SET
+           title=excluded.title,
+           period=excluded.period,
+           target=excluded.target,
+           reward_phn=excluded.reward_phn,
+           reward_xp=excluded.reward_xp,
+           active=1`,
         q.key,
         q.title,
         q.period,
@@ -166,6 +227,12 @@ async function seedQuests(db) {
         q.reward_xp,
       );
     }
+    // Deaktiviert alte Quests (Spiel-Quests)
+    const keys = quests.map((q) => q.key);
+    await db.run(
+      `UPDATE quests SET active = 0 WHERE key NOT IN (${keys.map(() => "?").join(",")})`,
+      keys,
+    );
     await db.exec("COMMIT");
   } catch (e) {
     await db.exec("ROLLBACK");
@@ -197,6 +264,69 @@ export async function setProfileName(db, chatId, profileName) {
 
 export async function setNameChange(db, chatId, ts) {
   await db.run("UPDATE users SET last_name_change = ? WHERE chat_id = ?", ts, chatId);
+}
+
+export async function setGameDailyProfit(db, chatId, dateStr, profit) {
+  await db.run(
+    "UPDATE users SET game_daily_date = ?, game_daily_profit = ? WHERE chat_id = ?",
+    dateStr,
+    profit,
+    chatId
+  );
+}
+
+export async function getCharacter(db, userId) {
+  return db.get("SELECT * FROM characters WHERE user_id = ?", userId);
+}
+
+export async function createCharacter(db, userId, name) {
+  const now = new Date().toISOString();
+  await db.run(
+    "INSERT INTO characters (user_id, name, created_at, last_tick) VALUES (?, ?, ?, ?)",
+    userId,
+    name,
+    now,
+    now
+  );
+}
+
+export async function updateCharacter(db, userId, fields) {
+  const keys = Object.keys(fields);
+  if (keys.length === 0) return;
+  const sets = keys.map((k) => `${k} = ?`).join(", ");
+  const vals = keys.map((k) => fields[k]);
+  vals.push(userId);
+  await db.run(`UPDATE characters SET ${sets} WHERE user_id = ?`, vals);
+}
+
+export async function setBan(db, userId, reason, expiresAt, createdBy) {
+  const now = new Date().toISOString();
+  await db.run(
+    `INSERT INTO bans (user_id, reason, expires_at, created_at, created_by)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(user_id) DO UPDATE SET
+       reason = excluded.reason,
+       expires_at = excluded.expires_at,
+       created_at = excluded.created_at,
+       created_by = excluded.created_by`,
+    userId,
+    reason || null,
+    expiresAt || null,
+    now,
+    createdBy
+  );
+}
+
+export async function getBan(db, userId) {
+  return db.get("SELECT * FROM bans WHERE user_id = ?", userId);
+}
+
+export async function clearBan(db, userId) {
+  await db.run("DELETE FROM bans WHERE user_id = ?", userId);
+}
+
+export async function listBans(db) {
+  return db.all("SELECT * FROM bans ORDER BY created_at DESC");
 }
 
 export async function setBalance(db, chatId, phn) {
@@ -284,6 +414,10 @@ export async function listFriends(db, userId) {
 
 export async function listQuests(db, period) {
   return db.all("SELECT * FROM quests WHERE active = 1 AND period = ?", period);
+}
+
+export async function getQuestByKey(db, key) {
+  return db.get("SELECT * FROM quests WHERE key = ? AND active = 1", key);
 }
 
 export async function ensureUserQuest(db, userId, questId) {
