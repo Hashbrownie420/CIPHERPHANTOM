@@ -16,6 +16,7 @@ import {
   getUser,
   createUser,
   setProfileName,
+  setBalance,
   addBalance,
   addXp,
   setDaily,
@@ -28,6 +29,8 @@ import {
   setPreDsgvoAccepted,
   getPreDsgvoAccepted,
   clearPreDsgvoAccepted,
+  setWalletAddress,
+  getUserByWalletAddress,
   getFriendByCode,
   addFriend,
   listFriends,
@@ -69,6 +72,7 @@ const HOUSE_EDGE = 0;
 const GAME_COOLDOWN_MS = 5 * 60 * 1000;
 const lastGameAt = new Map();
 const XP_LEVEL_FACTOR = 350;
+const MAX_TRANSFER_PHN = 1000;
 const blackjackSessions = new Map();
 const stackerSessions = new Map();
 const CHAR_PRICE = 500;
@@ -336,6 +340,26 @@ function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
+function satietyFromHunger(hunger) {
+  return clamp(100 - hunger, 0, 100);
+}
+
+async function ensureWalletAddress(db, user) {
+  if (user.wallet_address) return user.wallet_address;
+  for (let i = 0; i < 5; i += 1) {
+    const addr = `PHN-${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+    const existing = await getUserByWalletAddress(db, addr);
+    if (!existing) {
+      await setWalletAddress(db, user.chat_id, addr);
+      return addr;
+    }
+  }
+  // Fallback (should be extremely rare)
+  const addr = `PHN-${Date.now().toString(36).toUpperCase()}`;
+  await setWalletAddress(db, user.chat_id, addr);
+  return addr;
+}
+
 function gameCooldownRemaining(userId) {
   const last = lastGameAt.get(userId) || 0;
   const remaining = GAME_COOLDOWN_MS - (Date.now() - last);
@@ -409,7 +433,7 @@ async function tickCharacter(db, char) {
   const last = char.last_tick ? new Date(char.last_tick).getTime() : now;
   const hours = Math.max(0, (now - last) / 3600000);
 
-  // Hunger steigt langsam, Gesundheit sinkt wenn Hunger hoch ist
+  // Hunger steigt langsam (Sattheit sinkt), Gesundheit sinkt wenn Hunger hoch ist
   let hunger = char.hunger + hours * 2.5; // +2.5 pro Stunde
   hunger = clamp(hunger, 0, 100);
 
@@ -887,9 +911,9 @@ async function sendGuidePdf(sock, chatId, prefix) {
   ]);
 
   section("Charakter-System", [
-    `${prefix}char zeigt Status (Alter, Gesundheit, Hunger). Alter steigt mit Level.`,
-    `${prefix}work bringt PHN + XP (Cooldown 3h). Arbeit erhoeht Hunger und senkt Gesundheit.`,
-    `${prefix}feed (snack|meal|feast) reduziert Hunger und steigert Gesundheit.`,
+    `${prefix}char zeigt Status (Alter, Gesundheit, Sattheit). Alter steigt mit Level.`,
+    `${prefix}work bringt PHN + XP (Cooldown 3h). Arbeit senkt Sattheit und senkt Gesundheit.`,
+    `${prefix}feed (snack|meal|feast) erhoeht Sattheit und steigert Gesundheit.`,
     `${prefix}med (small|big) steigert Gesundheit.`,
     `Name des Charakters kann 2x geaendert werden: ${prefix}charname <neuer_name>.`,
   ]);
@@ -1401,6 +1425,7 @@ async function start() {
             `${prefix}xp`,
             `${prefix}name <neuer_name>`,
             `${prefix}wallet`,
+            `${prefix}pay <wallet_address> <betrag>`,
             `${prefix}flip <betrag> <kopf|zahl>`,
             `${prefix}slots <betrag>`,
             `${prefix}roulette <betrag> <rot|schwarz|gerade|ungerade|zahl> [wert]`,
@@ -1432,6 +1457,8 @@ async function start() {
                   `${prefix}ban <id|@user> [dauer] [grund]`,
                   `${prefix}unban <id|@user>`,
                   `${prefix}bans`,
+                  `${prefix}setphn <id|@user> <betrag>`,
+                  `${prefix}purge <id|@user>`,
                 ]
               : []),
           ],
@@ -1541,6 +1568,7 @@ async function start() {
         const levelRole = getLevelRole(1);
         await createUser(db, chatId, profileName, code, userRole, levelRole);
         user = await getUser(db, chatId);
+        const walletAddress = await ensureWalletAddress(db, user);
         await setDsgvoAccepted(db, chatId, pre.accepted_at, pre.version);
         await clearPreDsgvoAccepted(db, chatId);
 
@@ -1553,6 +1581,7 @@ async function start() {
             `Profil: ${user.profile_name}`,
             `Freundescode: ${user.friend_code}`,
             `Wallet: ${user.phn} ${CURRENCY}`,
+            `Wallet-Adresse: ${walletAddress}`,
           ],
           "",
           "✅",
@@ -1581,6 +1610,7 @@ async function start() {
             `Rolle: ${roles.userRole} | Levelrolle: ${roles.levelRole}`,
             `Level: ${user.level} (XP: ${user.xp}, bis Level-Up: ${xpToNextLevel(user.xp)})`,
             `Wallet: ${user.phn} ${CURRENCY}`,
+            `Wallet-Adresse: ${await ensureWalletAddress(db, user)}`,
             `Daily Streak: ${user.daily_streak}`,
             `Freundescode: ${user.friend_code}`,
             `Erstellt: ${formatDateTime(user.created_at)}`,
@@ -1761,7 +1791,82 @@ async function start() {
           chatId,
           m,
           "Wallet",
-          [`Stand: ${user.phn} ${CURRENCY} (${CURRENCY_NAME})`],
+          [
+            `Stand: ${user.phn} ${CURRENCY} (${CURRENCY_NAME})`,
+            `Adresse: ${await ensureWalletAddress(db, user)}`,
+            `Transfer-Limit: ${MAX_TRANSFER_PHN} ${CURRENCY}`,
+          ],
+          "",
+          "💰",
+        );
+        break;
+      }
+
+      case "pay": {
+        // Transfer per Wallet-Adresse
+        const user = await requireVerified(
+          sock,
+          m,
+          chatId,
+          prefix,
+          await getUser(db, chatId),
+        );
+        if (!user) break;
+        const address = (args[0] || "").trim().toUpperCase();
+        const amount = Number(args[1]);
+        if (!address || !amount || amount <= 0 || !Number.isFinite(amount)) {
+          await sendText(
+            sock,
+            chatId,
+            m,
+            "Usage",
+            [`${prefix}pay <wallet_address> <betrag>`],
+            "",
+            "ℹ️",
+          );
+          break;
+        }
+        if (amount > MAX_TRANSFER_PHN) {
+          await sendText(
+            sock,
+            chatId,
+            m,
+            "Limit",
+            [`Max pro Transfer: ${MAX_TRANSFER_PHN} ${CURRENCY}`],
+            "",
+            "⚠️",
+          );
+          break;
+        }
+        const toUser = await getUserByWalletAddress(db, address);
+        if (!toUser) {
+          await sendText(sock, chatId, m, "Fehler", ["Adresse nicht gefunden."], "", "⚠️");
+          break;
+        }
+        if (toUser.chat_id === chatId) {
+          await sendText(sock, chatId, m, "Fehler", ["Du kannst nicht an dich selbst senden."], "", "⚠️");
+          break;
+        }
+        if (user.phn < amount) {
+          await sendText(sock, chatId, m, "Nicht genug PHN", ["Wallet ist zu niedrig."], "", "💸");
+          break;
+        }
+        await addBalance(db, chatId, -amount);
+        await addBalance(db, toUser.chat_id, amount);
+        await sendText(
+          sock,
+          chatId,
+          m,
+          "Transfer gesendet",
+          [`-${amount} ${CURRENCY}`, `An: ${address}`],
+          "",
+          "💸",
+        );
+        await sendPlain(
+          sock,
+          toUser.chat_id,
+          "Transfer erhalten",
+          [`+${amount} ${CURRENCY}`, `Von: ${await ensureWalletAddress(db, user)}`],
           "",
           "💰",
         );
@@ -1798,13 +1903,14 @@ async function start() {
           await addBalance(db, chatId, -penaltyPhn);
           await applyXpDelta(db, chatId, user.xp, -200);
         }
-        if (updated.hunger <= 5) {
+        const satiety = satietyFromHunger(updated.hunger);
+        if (satiety <= 5) {
           await sendText(
             sock,
             chatId,
             m,
             "Warnung",
-            ["Hunger sehr niedrig (unter 5)."],
+            ["Sattheit sehr niedrig (unter 5)."],
             "",
             "⚠️",
           );
@@ -1818,7 +1924,7 @@ async function start() {
           [
             `Alter: ${age} Jahre (Level ${user.level})`,
             `Gesundheit: ${updated.health}/100`,
-            `Hunger: ${updated.hunger}/100`,
+            `Sattheit: ${satiety}/100`,
             `Letzte Arbeit: ${updated.last_work ? formatDateTime(updated.last_work) : "-"}`,
             `Letztes Essen: ${updated.last_feed ? formatDateTime(updated.last_feed) : "-"}`,
             ...(maintenance > 0
@@ -2011,13 +2117,14 @@ async function start() {
           await addBalance(db, chatId, -penaltyPhn);
           await applyXpDelta(db, chatId, user.xp, -200);
         }
-        if (updated.hunger <= 5) {
+        const satiety = satietyFromHunger(updated.hunger);
+        if (satiety <= 5) {
           await sendText(
             sock,
             chatId,
             m,
             "Warnung",
-            ["Hunger sehr niedrig (unter 5)."],
+            ["Sattheit sehr niedrig (unter 5)."],
             "",
             "⚠️",
           );
@@ -2034,7 +2141,7 @@ async function start() {
           );
           break;
         }
-        if (updated.hunger >= 90) {
+        if (satiety <= 10) {
           await sendText(
             sock,
             chatId,
@@ -2105,7 +2212,7 @@ async function start() {
             ...(maintenance > 0
               ? [`Unterhalt heute: -${maintenance} ${CURRENCY}`]
               : []),
-            "Hunger +25",
+            "Sattheit -25",
             "Gesundheit -8",
           ],
           "",
@@ -2139,9 +2246,9 @@ async function start() {
         }
         const type = (args[0] || "").toLowerCase();
         const menu = {
-          snack: { cost: 40, hunger: +20, health: -5 },
-          meal: { cost: 120, hunger: +45, health: -12 },
-          feast: { cost: 300, hunger: +80, health: -25 },
+          snack: { cost: 40, hunger: -20, health: +5 },
+          meal: { cost: 120, hunger: -45, health: +12 },
+          feast: { cost: 300, hunger: -80, health: +25 },
         };
         const item = menu[type];
         if (!item) {
@@ -2190,7 +2297,7 @@ async function start() {
           [
             `Artikel: ${type.toUpperCase()}`,
             `Preis: ${item.cost} ${CURRENCY}`,
-            `Effekt: Hunger ${item.hunger}, Gesundheit +${item.health}`,
+            `Effekt: Sattheit +${Math.abs(item.hunger)}, Gesundheit +${item.health}`,
             ...(maintenance > 0
               ? [`Unterhalt heute: ${maintenance} ${CURRENCY}`]
               : []),
@@ -2370,9 +2477,9 @@ async function start() {
         }
 
         const feedMenu = {
-          snack: { cost: 40, hunger: +20, health: -5 },
-          meal: { cost: 120, hunger: +45, health: -12 },
-          feast: { cost: 300, hunger: +80, health: -25 },
+          snack: { cost: 40, hunger: -20, health: +5 },
+          meal: { cost: 120, hunger: -45, health: +12 },
+          feast: { cost: 300, hunger: -80, health: +25 },
         };
         const medMenu = {
           small: { cost: 80, health: +20 },
@@ -2428,6 +2535,7 @@ async function start() {
           await addBalance(db, chatId, -item.cost);
           const hunger = clamp(updated.hunger + item.hunger, 0, 100);
           const health = clamp(updated.health + item.health, 0, 100);
+          const satiety = satietyFromHunger(hunger);
           await updateCharacter(db, chatId, {
             hunger,
             health,
@@ -2440,7 +2548,7 @@ async function start() {
           if (health >= 80) {
             await addQuestProgress(db, chatId, "daily_keep_health", 1);
           }
-          if (hunger <= 30) {
+          if (satiety <= 30) {
             await addQuestProgress(db, chatId, "daily_hunger_low", 1);
           }
           await sendText(
@@ -2449,7 +2557,7 @@ async function start() {
             m,
             `${entry.itemKey.toUpperCase()} gegessen`,
             [
-              `Hunger: ${hunger}/100`,
+              `Sattheit: ${satiety}/100`,
               `Gesundheit: ${health}/100`,
               ...(paidMaintenance > 0
                 ? [`Unterhalt heute: -${paidMaintenance} ${CURRENCY}`]
@@ -2471,7 +2579,7 @@ async function start() {
           if (health >= 80) {
             await addQuestProgress(db, chatId, "daily_keep_health", 1);
           }
-          if (updated.hunger <= 30) {
+          if (satietyFromHunger(updated.hunger) <= 30) {
             await addQuestProgress(db, chatId, "daily_hunger_low", 1);
           }
           await sendText(
@@ -3907,6 +4015,60 @@ async function start() {
           "",
           "✅",
         );
+        break;
+      }
+
+      case "setphn": {
+        // Owner: PHN manuell setzen
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        const targetId = extractTargetId(m, args);
+        const amount = Number(args[1]);
+        if (!targetId || !Number.isFinite(amount) || amount < 0) {
+          await sendText(
+            sock,
+            chatId,
+            m,
+            "Usage",
+            [`${prefix}setphn <id|@user> <betrag>`],
+            "",
+            "ℹ️",
+          );
+          break;
+        }
+        const targetUser = await getUser(db, targetId);
+        if (!targetUser) {
+          await sendText(sock, chatId, m, "Fehler", ["User nicht gefunden."], "", "⚠️");
+          break;
+        }
+        await setBalance(db, targetId, Math.floor(amount));
+        await sendText(
+          sock,
+          chatId,
+          m,
+          "PHN gesetzt",
+          [`User: ${targetId}`, `Neuer Stand: ${Math.floor(amount)} ${CURRENCY}`],
+          "",
+          "✅",
+        );
+        break;
+      }
+
+      case "purge": {
+        // Owner: Profil komplett loeschen
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        const targetId = extractTargetId(m, args);
+        if (!targetId) {
+          await sendText(sock, chatId, m, "Usage", [`${prefix}purge <id|@user>`], "", "ℹ️");
+          break;
+        }
+        await deleteUser(db, targetId);
+        await sendText(sock, chatId, m, "Profil geloescht", [`User: ${targetId}`], "", "🗑️");
         break;
       }
 

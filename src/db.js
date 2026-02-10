@@ -25,6 +25,7 @@ export async function initDb() {
       chat_id TEXT PRIMARY KEY,
       profile_name TEXT NOT NULL,
       friend_code TEXT UNIQUE NOT NULL,
+      wallet_address TEXT UNIQUE,
       created_at TEXT NOT NULL,
       xp INTEGER NOT NULL DEFAULT 0,
       level INTEGER NOT NULL DEFAULT 1,
@@ -98,6 +99,7 @@ export async function initDb() {
 
   // Ensure unique constraint for upserts
   await db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_quests_key ON quests(key)");
+  await db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_wallet ON users(wallet_address)");
 
   await ensureUserColumns(db);
   await seedQuests(db);
@@ -127,6 +129,9 @@ async function ensureUserColumns(db) {
   }
   if (!names.has("game_daily_profit")) {
     await db.exec("ALTER TABLE users ADD COLUMN game_daily_profit INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!names.has("wallet_address")) {
+    await db.exec("ALTER TABLE users ADD COLUMN wallet_address TEXT");
   }
 }
 
@@ -158,7 +163,7 @@ async function seedQuests(db) {
     },
     {
       key: "daily_hunger_low",
-      title: "Hunger unter 30 halten",
+      title: "Sattheit unter 30 halten",
       period: "daily",
       target: 1,
       reward_phn: 100,
@@ -247,9 +252,9 @@ export async function getUser(db, chatId) {
 export async function createUser(db, chatId, profileName, friendCode, userRole, levelRole) {
   const now = new Date().toISOString();
   await db.run(
-    `INSERT INTO users (chat_id, profile_name, friend_code, created_at)
-     VALUES (?, ?, ?, ?)`
-  , chatId, profileName, friendCode, now);
+    `INSERT INTO users (chat_id, profile_name, friend_code, created_at, wallet_address)
+     VALUES (?, ?, ?, ?, ?)`
+  , chatId, profileName, friendCode, now, null);
   await db.run(
     "UPDATE users SET user_role = ?, level_role = ? WHERE chat_id = ?",
     userRole,
@@ -260,6 +265,14 @@ export async function createUser(db, chatId, profileName, friendCode, userRole, 
 
 export async function setProfileName(db, chatId, profileName) {
   await db.run("UPDATE users SET profile_name = ? WHERE chat_id = ?", profileName, chatId);
+}
+
+export async function setWalletAddress(db, chatId, walletAddress) {
+  await db.run("UPDATE users SET wallet_address = ? WHERE chat_id = ?", walletAddress, chatId);
+}
+
+export async function getUserByWalletAddress(db, walletAddress) {
+  return db.get("SELECT * FROM users WHERE wallet_address = ?", walletAddress);
 }
 
 export async function setNameChange(db, chatId, ts) {
@@ -472,6 +485,8 @@ export async function deleteUser(db, chatId) {
       chatId,
       chatId
     );
+    await db.run("DELETE FROM characters WHERE user_id = ?", chatId);
+    await db.run("DELETE FROM bans WHERE user_id = ?", chatId);
     await db.run("DELETE FROM users WHERE chat_id = ?", chatId);
     await db.run("DELETE FROM dsgvo_accepts WHERE chat_id = ?", chatId);
     await db.exec("COMMIT");
