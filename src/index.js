@@ -3,6 +3,7 @@ import {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   DisconnectReason,
+  downloadContentFromMessage,
 } from "@whiskeysockets/baileys";
 import P from "pino";
 import qrcode from "qrcode-terminal";
@@ -59,12 +60,13 @@ const __dirname = path.dirname(__filename);
 // Speicherorte fuer Daten und WhatsApp-Session
 const DATA_DIR = path.resolve(__dirname, "..", "data");
 const PREFIX_FILE = path.join(DATA_DIR, "prefixes.json");
+const INBOX_DIR = path.join(DATA_DIR, "inbox");
 const AUTH_DIR = path.resolve(__dirname, "..", "auth");
 const CURRENCY = "PHN";
 const CURRENCY_NAME = "Phantoms";
 const DSGVO_VERSION = "2026-02-09";
 const pendingDeletes = new Map();
-const OWNER_IDS = new Set(["72271934840903@lid", "77112346173682@lid"]);
+const OWNER_IDS = new Set(["72271934840903@lid", "97112346173682@lid"]);
 const pendingNameChanges = new Map();
 const pendingPurchases = new Map();
 const GAME_DAILY_PROFIT_CAP = Number.POSITIVE_INFINITY;
@@ -409,6 +411,38 @@ function extractTargetId(m, args) {
     m.message?.extendedTextMessage?.contextInfo?.participant || null;
   const direct = args[0] || null;
   return mentioned || quoted || direct;
+}
+
+function getMediaFromMessage(msg) {
+  if (!msg) return null;
+  if (msg.imageMessage) return { type: "image", content: msg.imageMessage };
+  if (msg.videoMessage) return { type: "video", content: msg.videoMessage };
+  if (msg.documentMessage) return { type: "document", content: msg.documentMessage };
+  if (msg.audioMessage) return { type: "audio", content: msg.audioMessage };
+  if (msg.stickerMessage) return { type: "sticker", content: msg.stickerMessage };
+  return null;
+}
+
+async function downloadMediaToBuffer(content, type) {
+  const stream = await downloadContentFromMessage(content, type);
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+
+function extFromMime(mime, fallback) {
+  if (!mime) return fallback;
+  const map = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "video/mp4": ".mp4",
+    "audio/ogg": ".ogg",
+    "audio/mpeg": ".mp3",
+    "application/pdf": ".pdf",
+    "text/plain": ".txt",
+  };
+  return map[mime] || fallback;
 }
 
 function estimateMaintenance(user, char) {
@@ -1224,6 +1258,7 @@ function parseCommand(text, prefix) {
 async function start() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(PREFIX_FILE)) savePrefixes({});
+  if (!fs.existsSync(INBOX_DIR)) fs.mkdirSync(INBOX_DIR, { recursive: true });
 
   printBanner();
 
@@ -1459,6 +1494,7 @@ async function start() {
                   `${prefix}bans`,
                   `${prefix}setphn <id|@user> <betrag>`,
                   `${prefix}purge <id|@user>`,
+                  `${prefix}sendpc <text|datei>`,
                 ]
               : []),
           ],
@@ -1635,7 +1671,10 @@ async function start() {
         const level = xpToLevel(user.xp);
         const nextAt = Math.pow(level, 2) * XP_LEVEL_FACTOR;
         const remaining = xpToNextLevel(user.xp);
-        const progress = Math.min(100, Math.round(((nextAt - remaining) / nextAt) * 100));
+        const progress = Math.min(
+          100,
+          Math.round(((nextAt - remaining) / nextAt) * 100),
+        );
         await sendText(
           sock,
           chatId,
@@ -1840,15 +1879,39 @@ async function start() {
         }
         const toUser = await getUserByWalletAddress(db, address);
         if (!toUser) {
-          await sendText(sock, chatId, m, "Fehler", ["Adresse nicht gefunden."], "", "⚠️");
+          await sendText(
+            sock,
+            chatId,
+            m,
+            "Fehler",
+            ["Adresse nicht gefunden."],
+            "",
+            "⚠️",
+          );
           break;
         }
         if (toUser.chat_id === chatId) {
-          await sendText(sock, chatId, m, "Fehler", ["Du kannst nicht an dich selbst senden."], "", "⚠️");
+          await sendText(
+            sock,
+            chatId,
+            m,
+            "Fehler",
+            ["Du kannst nicht an dich selbst senden."],
+            "",
+            "⚠️",
+          );
           break;
         }
         if (user.phn < amount) {
-          await sendText(sock, chatId, m, "Nicht genug PHN", ["Wallet ist zu niedrig."], "", "💸");
+          await sendText(
+            sock,
+            chatId,
+            m,
+            "Nicht genug PHN",
+            ["Wallet ist zu niedrig."],
+            "",
+            "💸",
+          );
           break;
         }
         await addBalance(db, chatId, -amount);
@@ -1866,7 +1929,10 @@ async function start() {
           sock,
           toUser.chat_id,
           "Transfer erhalten",
-          [`+${amount} ${CURRENCY}`, `Von: ${await ensureWalletAddress(db, user)}`],
+          [
+            `+${amount} ${CURRENCY}`,
+            `Von: ${await ensureWalletAddress(db, user)}`,
+          ],
           "",
           "💰",
         );
@@ -4021,7 +4087,15 @@ async function start() {
       case "setphn": {
         // Owner: PHN manuell setzen
         if (!isOwner(senderId)) {
-          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          await sendText(
+            sock,
+            chatId,
+            m,
+            "Kein Zugriff",
+            ["Owner only."],
+            "",
+            "🚫",
+          );
           break;
         }
         const targetId = extractTargetId(m, args);
@@ -4040,7 +4114,15 @@ async function start() {
         }
         const targetUser = await getUser(db, targetId);
         if (!targetUser) {
-          await sendText(sock, chatId, m, "Fehler", ["User nicht gefunden."], "", "⚠️");
+          await sendText(
+            sock,
+            chatId,
+            m,
+            "Fehler",
+            ["User nicht gefunden."],
+            "",
+            "⚠️",
+          );
           break;
         }
         await setBalance(db, targetId, Math.floor(amount));
@@ -4049,7 +4131,10 @@ async function start() {
           chatId,
           m,
           "PHN gesetzt",
-          [`User: ${targetId}`, `Neuer Stand: ${Math.floor(amount)} ${CURRENCY}`],
+          [
+            `User: ${targetId}`,
+            `Neuer Stand: ${Math.floor(amount)} ${CURRENCY}`,
+          ],
           "",
           "✅",
         );
@@ -4059,16 +4144,40 @@ async function start() {
       case "purge": {
         // Owner: Profil komplett loeschen
         if (!isOwner(senderId)) {
-          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          await sendText(
+            sock,
+            chatId,
+            m,
+            "Kein Zugriff",
+            ["Owner only."],
+            "",
+            "🚫",
+          );
           break;
         }
         const targetId = extractTargetId(m, args);
         if (!targetId) {
-          await sendText(sock, chatId, m, "Usage", [`${prefix}purge <id|@user>`], "", "ℹ️");
+          await sendText(
+            sock,
+            chatId,
+            m,
+            "Usage",
+            [`${prefix}purge <id|@user>`],
+            "",
+            "ℹ️",
+          );
           break;
         }
         await deleteUser(db, targetId);
-        await sendText(sock, chatId, m, "Profil geloescht", [`User: ${targetId}`], "", "🗑️");
+        await sendText(
+          sock,
+          chatId,
+          m,
+          "Profil geloescht",
+          [`User: ${targetId}`],
+          "",
+          "🗑️",
+        );
         break;
       }
 
@@ -4117,6 +4226,96 @@ async function start() {
           break;
         }
         await sendText(sock, chatId, m, "Bans", lines, "", "⛔");
+        break;
+      }
+
+      case "sendpc":
+      case "pcupload": {
+        // Owner: Text/Datei vom Handy auf den Laptop speichern
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        const quotedMsg =
+          m.message?.extendedTextMessage?.contextInfo?.quotedMessage || null;
+        const media =
+          getMediaFromMessage(m.message) || getMediaFromMessage(quotedMsg);
+        const rawBody = (body || "").slice(prefix.length).trim();
+        const raw = rawBody.replace(/^sendpc\b/i, "").replace(/^pcupload\b/i, "").trim();
+        let customName = "";
+        let text = raw;
+        const nameMatch = raw.match(/--name\s+"([^"]+)"\s*([\s\S]*)$/);
+        if (nameMatch) {
+          customName = nameMatch[1].trim();
+          text = (nameMatch[2] || "");
+        }
+
+        if (!media && !text) {
+          await sendText(
+            sock,
+            chatId,
+            m,
+            "Usage",
+            [`${prefix}sendpc --name "DATEI" <text>`],
+            "",
+            "ℹ️",
+          );
+          break;
+        }
+
+        if (media) {
+          const buf = await downloadMediaToBuffer(media.content, media.type);
+          const mime = media.content?.mimetype;
+          const fileName =
+            media.type === "document" && media.content?.fileName
+              ? media.content.fileName
+              : null;
+          const ext = extFromMime(
+            mime,
+            media.type === "image"
+              ? ".jpg"
+              : media.type === "video"
+                ? ".mp4"
+                : media.type === "audio"
+                  ? ".ogg"
+                  : ".bin",
+          );
+          const base = customName
+            ? customName + (customName.includes(".") ? "" : ext)
+            : fileName ||
+              `${media.type}-${new Date().toISOString().replace(/[:.]/g, "-")}${ext}`;
+          const safeName = base.replace(/[^\w.\-() ]+/g, "_");
+          const filePath = path.join(INBOX_DIR, safeName);
+          fs.writeFileSync(filePath, buf);
+          await sendText(
+            sock,
+            chatId,
+            m,
+            "Gespeichert",
+            [`Datei: ${safeName}`, `Groesse: ${formatBytes(buf.length)}`],
+            "",
+            "✅",
+          );
+          break;
+        }
+
+        // Text speichern
+        const ts = new Date().toISOString().replace(/[:.]/g, "-");
+        const base = customName
+          ? customName + (customName.endsWith(".txt") ? "" : ".txt")
+          : `text-${ts}.txt`;
+        const safeName = base.replace(/[^\w.\-() ]+/g, "_");
+        const filePath = path.join(INBOX_DIR, safeName);
+        fs.writeFileSync(filePath, text, "utf8");
+        await sendText(
+          sock,
+          chatId,
+          m,
+          "Gespeichert",
+          [`Text-Datei: ${path.basename(filePath)}`],
+          "",
+          "✅",
+        );
         break;
       }
 

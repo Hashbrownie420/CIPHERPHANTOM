@@ -97,11 +97,11 @@ export async function initDb() {
     );
   `);
 
+  await ensureUserColumns(db);
+
   // Ensure unique constraint for upserts
   await db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_quests_key ON quests(key)");
   await db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_wallet ON users(wallet_address)");
-
-  await ensureUserColumns(db);
   await seedQuests(db);
   return db;
 }
@@ -252,9 +252,9 @@ export async function getUser(db, chatId) {
 export async function createUser(db, chatId, profileName, friendCode, userRole, levelRole) {
   const now = new Date().toISOString();
   await db.run(
-    `INSERT INTO users (chat_id, profile_name, friend_code, created_at, wallet_address)
-     VALUES (?, ?, ?, ?, ?)`
-  , chatId, profileName, friendCode, now, null);
+    `INSERT INTO users (chat_id, profile_name, friend_code, created_at)
+     VALUES (?, ?, ?, ?)`
+  , chatId, profileName, friendCode, now);
   await db.run(
     "UPDATE users SET user_role = ?, level_role = ? WHERE chat_id = ?",
     userRole,
