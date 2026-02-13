@@ -51,6 +51,11 @@ import {
   getBan,
   clearBan,
   listBans,
+  addOwnerTodo,
+  listOwnerTodos,
+  updateOwnerTodo,
+  deleteOwnerTodo,
+  setOwnerTodoStatus,
 } from "./db.js";
 
 // Pfad-Utilities fuer ES Modules (kein __dirname von Haus aus)
@@ -66,7 +71,7 @@ const CURRENCY = "PHN";
 const CURRENCY_NAME = "Phantoms";
 const DSGVO_VERSION = "2026-02-09";
 const pendingDeletes = new Map();
-const OWNER_IDS = new Set(["72271934840903@lid", "97112346173682@lid"]);
+const OWNER_IDS = new Set(["72271934840903@lid"]);
 const pendingNameChanges = new Map();
 const pendingPurchases = new Map();
 const GAME_DAILY_PROFIT_CAP = Number.POSITIVE_INFINITY;
@@ -1494,6 +1499,7 @@ async function start() {
                   `${prefix}bans`,
                   `${prefix}setphn <id|@user> <betrag>`,
                   `${prefix}purge <id|@user>`,
+                  `${prefix}todo <add|list|edit|done|del> ...`,
                   `${prefix}sendpc <text|datei>`,
                 ]
               : []),
@@ -4178,6 +4184,110 @@ async function start() {
           "",
           "🗑️",
         );
+        break;
+      }
+
+      case "todo": {
+        // Owner: ToDo-Liste verwalten (add/list/edit/done/del)
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+
+        const action = (args[0] || "").toLowerCase();
+
+        if (!action || !["add", "list", "edit", "done", "del", "delete"].includes(action)) {
+          await sendText(
+            sock,
+            chatId,
+            m,
+            "Usage",
+            [
+              `${prefix}todo add <text>`,
+              `${prefix}todo list [open|done|all]`,
+              `${prefix}todo edit <id> <text>`,
+              `${prefix}todo done <id>`,
+              `${prefix}todo del <id>`,
+            ],
+            "",
+            "ℹ️",
+          );
+          break;
+        }
+
+        if (action === "add") {
+          const text = args.slice(1).join(" ").trim();
+          if (!text) {
+            await sendText(sock, chatId, m, "Fehler", ["Text fehlt."], "", "⚠️");
+            break;
+          }
+          await addOwnerTodo(db, text, senderId);
+          await sendText(sock, chatId, m, "ToDo erstellt", [text], "", "✅");
+          break;
+        }
+
+        if (action === "list") {
+          const mode = (args[1] || "open").toLowerCase();
+          const status = ["open", "done", "all"].includes(mode) ? mode : "open";
+          const todos = await listOwnerTodos(db, status);
+          if (!todos.length) {
+            await sendText(sock, chatId, m, "ToDos", [`Keine Eintraege fuer '${status}'.`], "", "📋");
+            break;
+          }
+          const lines = todos.map((t) => {
+            const when = formatDateTime(t.done_at || t.updated_at || t.created_at);
+            const state = t.status === "done" ? "done" : "open";
+            return `#${t.id} | ${state} | ${when}\n${t.text}`;
+          });
+          await sendText(sock, chatId, m, `ToDos (${status}, ${todos.length})`, lines, "", "📋");
+          break;
+        }
+
+        if (action === "edit") {
+          const id = Number(args[1]);
+          const text = args.slice(2).join(" ").trim();
+          if (!Number.isInteger(id) || id <= 0 || !text) {
+            await sendText(sock, chatId, m, "Usage", [`${prefix}todo edit <id> <text>`], "", "ℹ️");
+            break;
+          }
+          const todos = await listOwnerTodos(db);
+          if (!todos.some((t) => t.id === id)) {
+            await sendText(sock, chatId, m, "Fehler", ["ToDo-ID nicht gefunden."], "", "⚠️");
+            break;
+          }
+          await updateOwnerTodo(db, id, text);
+          await sendText(sock, chatId, m, "ToDo aktualisiert", [`#${id}`, text], "", "✅");
+          break;
+        }
+
+        if (action === "done") {
+          const id = Number(args[1]);
+          if (!Number.isInteger(id) || id <= 0) {
+            await sendText(sock, chatId, m, "Usage", [`${prefix}todo done <id>`], "", "ℹ️");
+            break;
+          }
+          const todos = await listOwnerTodos(db, "all");
+          if (!todos.some((t) => t.id === id)) {
+            await sendText(sock, chatId, m, "Fehler", ["ToDo-ID nicht gefunden."], "", "⚠️");
+            break;
+          }
+          await setOwnerTodoStatus(db, id, "done");
+          await sendText(sock, chatId, m, "ToDo erledigt", [`#${id}`], "", "✅");
+          break;
+        }
+
+        const id = Number(args[1]);
+        if (!Number.isInteger(id) || id <= 0) {
+          await sendText(sock, chatId, m, "Usage", [`${prefix}todo del <id>`], "", "ℹ️");
+          break;
+        }
+        const todos = await listOwnerTodos(db, "all");
+        if (!todos.some((t) => t.id === id)) {
+          await sendText(sock, chatId, m, "Fehler", ["ToDo-ID nicht gefunden."], "", "⚠️");
+          break;
+        }
+        await deleteOwnerTodo(db, id);
+        await sendText(sock, chatId, m, "ToDo geloescht", [`#${id}`], "", "🗑️");
         break;
       }
 

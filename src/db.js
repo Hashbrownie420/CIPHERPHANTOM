@@ -95,9 +95,20 @@ export async function initDb() {
       created_at TEXT NOT NULL,
       created_by TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS owner_todos (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      text TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open',
+      done_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      created_by TEXT NOT NULL
+    );
   `);
 
   await ensureUserColumns(db);
+  await ensureOwnerTodoColumns(db);
 
   // Ensure unique constraint for upserts
   await db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_quests_key ON quests(key)");
@@ -132,6 +143,17 @@ async function ensureUserColumns(db) {
   }
   if (!names.has("wallet_address")) {
     await db.exec("ALTER TABLE users ADD COLUMN wallet_address TEXT");
+  }
+}
+
+async function ensureOwnerTodoColumns(db) {
+  const cols = await db.all("PRAGMA table_info(owner_todos)");
+  const names = new Set(cols.map((c) => c.name));
+  if (!names.has("status")) {
+    await db.exec("ALTER TABLE owner_todos ADD COLUMN status TEXT NOT NULL DEFAULT 'open'");
+  }
+  if (!names.has("done_at")) {
+    await db.exec("ALTER TABLE owner_todos ADD COLUMN done_at TEXT");
   }
 }
 
@@ -340,6 +362,53 @@ export async function clearBan(db, userId) {
 
 export async function listBans(db) {
   return db.all("SELECT * FROM bans ORDER BY created_at DESC");
+}
+
+export async function addOwnerTodo(db, text, createdBy) {
+  const now = new Date().toISOString();
+  await db.run(
+    "INSERT INTO owner_todos (text, status, done_at, created_at, updated_at, created_by) VALUES (?, 'open', NULL, ?, ?, ?)",
+    text,
+    now,
+    now,
+    createdBy
+  );
+}
+
+export async function listOwnerTodos(db, status = "all") {
+  if (status === "open" || status === "done") {
+    return db.all(
+      "SELECT * FROM owner_todos WHERE status = ? ORDER BY id DESC",
+      status
+    );
+  }
+  return db.all("SELECT * FROM owner_todos ORDER BY id DESC");
+}
+
+export async function updateOwnerTodo(db, id, text) {
+  const now = new Date().toISOString();
+  await db.run(
+    "UPDATE owner_todos SET text = ?, updated_at = ? WHERE id = ?",
+    text,
+    now,
+    id
+  );
+}
+
+export async function deleteOwnerTodo(db, id) {
+  await db.run("DELETE FROM owner_todos WHERE id = ?", id);
+}
+
+export async function setOwnerTodoStatus(db, id, status) {
+  const now = new Date().toISOString();
+  const doneAt = status === "done" ? now : null;
+  await db.run(
+    "UPDATE owner_todos SET status = ?, done_at = ?, updated_at = ? WHERE id = ?",
+    status,
+    doneAt,
+    now,
+    id
+  );
 }
 
 export async function setBalance(db, chatId, phn) {
