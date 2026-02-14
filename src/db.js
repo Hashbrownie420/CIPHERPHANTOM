@@ -105,15 +105,63 @@ export async function initDb() {
       updated_at TEXT NOT NULL,
       created_by TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS error_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      error_id TEXT UNIQUE NOT NULL,
+      severity TEXT NOT NULL DEFAULT 'error',
+      first_seen_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL,
+      occurrences INTEGER NOT NULL DEFAULT 1,
+      source TEXT NOT NULL,
+      command TEXT,
+      chat_id TEXT,
+      fingerprint TEXT NOT NULL DEFAULT '',
+      error_message TEXT NOT NULL,
+      error_stack TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS fix_queue (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      error_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open',
+      owner_note TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      created_by TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS owner_audit_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      created_at TEXT NOT NULL,
+      actor_id TEXT NOT NULL,
+      command TEXT NOT NULL,
+      target_id TEXT,
+      payload TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS command_help (
+      cmd TEXT PRIMARY KEY,
+      usage TEXT NOT NULL,
+      purpose TEXT NOT NULL,
+      tips TEXT,
+      owner_only INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
   `);
 
   await ensureUserColumns(db);
   await ensureOwnerTodoColumns(db);
+  await ensureErrorLogColumns(db);
 
   // Ensure unique constraint for upserts
   await db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_quests_key ON quests(key)");
   await db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_wallet ON users(wallet_address)");
+  await db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_error_logs_error_id ON error_logs(error_id)");
+  await db.exec("CREATE INDEX IF NOT EXISTS idx_error_logs_fingerprint_last_seen ON error_logs(fingerprint, last_seen_at)");
   await seedQuests(db);
+  await seedCommandHelp(db);
   return db;
 }
 
@@ -154,6 +202,29 @@ async function ensureOwnerTodoColumns(db) {
   }
   if (!names.has("done_at")) {
     await db.exec("ALTER TABLE owner_todos ADD COLUMN done_at TEXT");
+  }
+}
+
+async function ensureErrorLogColumns(db) {
+  const cols = await db.all("PRAGMA table_info(error_logs)");
+  const names = new Set(cols.map((c) => c.name));
+  const createdExpr = names.has("created_at") ? "created_at" : "datetime('now')";
+  if (!names.has("severity")) {
+    await db.exec("ALTER TABLE error_logs ADD COLUMN severity TEXT NOT NULL DEFAULT 'error'");
+  }
+  if (!names.has("first_seen_at")) {
+    await db.exec("ALTER TABLE error_logs ADD COLUMN first_seen_at TEXT");
+    await db.exec(`UPDATE error_logs SET first_seen_at = COALESCE(${createdExpr}, datetime('now')) WHERE first_seen_at IS NULL`);
+  }
+  if (!names.has("last_seen_at")) {
+    await db.exec("ALTER TABLE error_logs ADD COLUMN last_seen_at TEXT");
+    await db.exec(`UPDATE error_logs SET last_seen_at = COALESCE(${createdExpr}, datetime('now')) WHERE last_seen_at IS NULL`);
+  }
+  if (!names.has("occurrences")) {
+    await db.exec("ALTER TABLE error_logs ADD COLUMN occurrences INTEGER NOT NULL DEFAULT 1");
+  }
+  if (!names.has("fingerprint")) {
+    await db.exec("ALTER TABLE error_logs ADD COLUMN fingerprint TEXT NOT NULL DEFAULT ''");
   }
 }
 
@@ -260,6 +331,98 @@ async function seedQuests(db) {
       `UPDATE quests SET active = 0 WHERE key NOT IN (${keys.map(() => "?").join(",")})`,
       keys,
     );
+    await db.exec("COMMIT");
+  } catch (e) {
+    await db.exec("ROLLBACK");
+    throw e;
+  }
+}
+
+async function seedCommandHelp(db) {
+  const entries = [
+    ["menu", "menu", "Befehlsmenue", "Starte immer hier", 0],
+    ["help", "help <befehl>", "Befehlshilfe", "Nutze exakte Befehlsnamen", 0],
+    ["dsgvo", "dsgvo", "Datenschutztext", "Vor Registrierung lesen", 0],
+    ["accept", "accept", "DSGVO bestaetigen", "Danach registrieren", 0],
+    ["register", "register <name>", "Profil erstellen", "Name kurz halten", 0],
+    ["profile", "profile", "Profil ansehen", "Zeigt Rollen und Wallet", 0],
+    ["xp", "xp", "Levelstand", "Tipp: daily + quests", 0],
+    ["level", "level", "Levelstand", "Alias von xp", 0],
+    ["name", "name <neuer_name>", "Profilname aendern", "Hat Cooldown", 0],
+    ["wallet", "wallet", "Kontostand sehen", "Adresse fuer Transfers", 0],
+    ["pay", "pay <wallet_address> <betrag>", "PHN transferieren", "Limits beachten", 0],
+    ["char", "char", "Charakterstatus", "Sattheit beobachten", 0],
+    ["buychar", "buychar <name>", "Charakter kaufen", "Einmalig kaufen", 0],
+    ["charname", "charname <neuer_name>", "Charakter umbenennen", "Nur begrenzt moeglich", 0],
+    ["work", "work", "Arbeiten gehen", "Cooldown 3h", 0],
+    ["feed", "feed <snack|meal|feast>", "Charakter fuettern", "Vorher Kauf bestaetigen", 0],
+    ["med", "med <small|big>", "Medizin nutzen", "Vorher Kauf bestaetigen", 0],
+    ["confirmbuy", "confirmbuy <code>", "Kauf bestaetigen", "Interner Bestaetigungsbefehl", 0],
+    ["guide", "guide", "PDF Anleitung", "Fuer Neueinsteiger", 0],
+    ["flip", "flip <betrag> <kopf|zahl>", "Coinflip spielen", "5m Spiel-Cooldown", 0],
+    ["slots", "slots <betrag>", "Slots spielen", "5m Spiel-Cooldown", 0],
+    ["roulette", "roulette <betrag> <typ> [wert]", "Roulette spielen", "Typen: rot/schwarz/gerade/ungerade/zahl", 0],
+    ["blackjack", "blackjack <betrag>|hit|stand", "Blackjack spielen", "Erst Start mit Betrag", 0],
+    ["fish", "fish <betrag>", "Fishgame spielen", "Multiplikator zufaellig", 0],
+    ["stacker", "stacker <betrag>|cashout", "Stacker spielen", "Risiko stufenweise", 0],
+    ["daily", "daily", "Tagesbonus holen", "Streak erhoeht Belohnung", 0],
+    ["weekly", "weekly", "Wochenbonus holen", "1x pro Woche", 0],
+    ["quests", "quests <daily|weekly|monthly|progress>", "Questliste", "Passende Kategorie waehlen", 0],
+    ["claim", "claim <quest_id>", "Quest claimen", "Nur fertige Quests", 0],
+    ["friendcode", "friendcode", "Freundescode zeigen", "Zum Adden teilen", 0],
+    ["addfriend", "addfriend <code>", "Freund hinzufuegen", "Nicht selbst adden", 0],
+    ["friends", "friends", "Freundesliste", "Zeigt gespeicherte Freunde", 0],
+    ["delete", "delete", "Account loeschen", "Bestaetigungscode noetig", 0],
+    ["confirmdelete", "confirmdelete <code>", "Loeschung bestaetigen", "Interner Bestaetigungsbefehl", 0],
+    ["prefix", "prefix <neues_prefix>", "Prefix setzen", "Max 3 Zeichen", 0],
+    ["setprefix", "setprefix <neues_prefix>", "Prefix setzen", "Alias von prefix", 0],
+    ["ping", "ping", "Bot erreichbar?", "Schneller Check", 0],
+    ["confirmname", "confirmname <code>", "Namensaenderung bestaetigen", "Interner Bestaetigungsbefehl", 0],
+    ["chatid", "chatid", "Chat-ID sehen", "Owner only", 1],
+    ["syncroles", "syncroles", "Rollen synchronisieren", "Owner only", 1],
+    ["dbdump", "dbdump", "DB als PDF", "Owner only", 1],
+    ["ban", "ban <id|@user> [dauer] [grund]", "Nutzer sperren", "Owner only", 1],
+    ["unban", "unban <id|@user>", "Sperre aufheben", "Owner only", 1],
+    ["bans", "bans", "Sperrliste", "Owner only", 1],
+    ["setphn", "setphn <id|@user> <betrag>", "PHN setzen", "Owner only", 1],
+    ["purge", "purge <id|@user>", "Profil entfernen", "Owner only", 1],
+    ["todo", "todo <add|list|edit|done|del> ...", "Owner-Aufgaben", "Owner only", 1],
+    ["errors", "errors [limit] [severity]", "Fehlerliste", "Owner only", 1],
+    ["error", "error <FEHLER-ID>", "Fehlerdetails", "Owner only", 1],
+    ["errorfile", "errorfile <FEHLER-ID>", "Fehlerexport", "Owner only", 1],
+    ["fix", "fix <add|list|status> ...", "Fix-Queue", "Owner only", 1],
+    ["audits", "audits [limit]", "Owner-Auditlog", "Owner only", 1],
+    ["health", "health", "Bot-Status", "Owner only", 1],
+    ["sendpc", "sendpc --name \"DATEI\" <text|datei>", "Handy-Upload", "Owner only", 1],
+    ["pcupload", "pcupload --name \"DATEI\" <text|datei>", "Handy-Upload", "Alias von sendpc", 1],
+    ["helpadd", "helpadd <cmd> | <usage> | <nutzen> | [tipps] | [owner_only]", "Hilfeeintrag anlegen", "Owner only", 1],
+    ["helpedit", "helpedit <cmd> | <usage> | <nutzen> | [tipps] | [owner_only]", "Hilfeeintrag aendern", "Owner only", 1],
+    ["helpdel", "helpdel <cmd>", "Hilfeeintrag loeschen", "Owner only", 1],
+    ["helplist", "helplist [all|owner|public]", "Hilfeeintraege listen", "Owner only", 1],
+  ];
+
+  const now = new Date().toISOString();
+  await db.exec("BEGIN");
+  try {
+    for (const [cmd, usage, purpose, tips, ownerOnly] of entries) {
+      await db.run(
+        `INSERT INTO command_help (cmd, usage, purpose, tips, owner_only, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(cmd) DO UPDATE SET
+           usage = excluded.usage,
+           purpose = excluded.purpose,
+           tips = excluded.tips,
+           owner_only = excluded.owner_only,
+           updated_at = excluded.updated_at`,
+        cmd,
+        usage,
+        purpose,
+        tips || null,
+        ownerOnly ? 1 : 0,
+        now,
+        now
+      );
+    }
     await db.exec("COMMIT");
   } catch (e) {
     await db.exec("ROLLBACK");
@@ -409,6 +572,208 @@ export async function setOwnerTodoStatus(db, id, status) {
     now,
     id
   );
+}
+
+export async function upsertErrorLog(
+  db,
+  errorId,
+  severity,
+  source,
+  command,
+  chatId,
+  fingerprint,
+  message,
+  stack
+) {
+  const now = new Date().toISOString();
+  const cutoff = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+  const existing = await db.get(
+    `SELECT id, error_id, occurrences
+     FROM error_logs
+     WHERE fingerprint = ? AND last_seen_at >= ?
+     ORDER BY id DESC
+     LIMIT 1`,
+    fingerprint,
+    cutoff
+  );
+  if (existing) {
+    const nextCount = (existing.occurrences || 1) + 1;
+    await db.run(
+      `UPDATE error_logs
+       SET severity = ?, source = ?, command = ?, chat_id = ?, error_message = ?, error_stack = ?, last_seen_at = ?, occurrences = ?
+       WHERE id = ?`,
+      severity,
+      source,
+      command || null,
+      chatId || null,
+      message,
+      stack || null,
+      now,
+      nextCount,
+      existing.id
+    );
+    return { errorId: existing.error_id, deduped: true, occurrences: nextCount, firstSeenAt: null, lastSeenAt: now };
+  }
+  await db.run(
+    `INSERT INTO error_logs
+      (error_id, severity, first_seen_at, last_seen_at, occurrences, source, command, chat_id, fingerprint, error_message, error_stack)
+     VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)`,
+    errorId,
+    severity,
+    now,
+    now,
+    source,
+    command || null,
+    chatId || null,
+    fingerprint,
+    message,
+    stack || null
+  );
+  return { errorId, deduped: false, occurrences: 1, firstSeenAt: now, lastSeenAt: now };
+}
+
+export async function listErrorLogs(db, limit = 10, severity = "all") {
+  if (severity && severity !== "all") {
+    return db.all(
+      `SELECT error_id, severity, first_seen_at, last_seen_at, occurrences, source, command, chat_id, error_message
+       FROM error_logs
+       WHERE severity = ?
+       ORDER BY last_seen_at DESC
+       LIMIT ?`,
+      severity,
+      limit
+    );
+  }
+  return db.all(
+    `SELECT error_id, severity, first_seen_at, last_seen_at, occurrences, source, command, chat_id, error_message
+     FROM error_logs
+     ORDER BY last_seen_at DESC
+     LIMIT ?`,
+    limit
+  );
+}
+
+export async function getErrorLogById(db, errorId) {
+  return db.get(
+    `SELECT error_id, severity, first_seen_at, last_seen_at, occurrences, source, command, chat_id, error_message, error_stack
+     FROM error_logs
+     WHERE error_id = ?`,
+    errorId
+  );
+}
+
+export async function addFixQueueEntry(db, errorId, ownerNote, createdBy) {
+  const now = new Date().toISOString();
+  await db.run(
+    `INSERT INTO fix_queue (error_id, status, owner_note, created_at, updated_at, created_by)
+     VALUES (?, 'open', ?, ?, ?, ?)`,
+    errorId,
+    ownerNote || null,
+    now,
+    now,
+    createdBy
+  );
+}
+
+export async function listFixQueue(db, status = "all", limit = 20) {
+  if (status === "open" || status === "in_progress" || status === "done") {
+    return db.all(
+      `SELECT * FROM fix_queue WHERE status = ? ORDER BY id DESC LIMIT ?`,
+      status,
+      limit
+    );
+  }
+  return db.all(`SELECT * FROM fix_queue ORDER BY id DESC LIMIT ?`, limit);
+}
+
+export async function updateFixQueueStatus(db, id, status, ownerNote = null) {
+  const now = new Date().toISOString();
+  await db.run(
+    "UPDATE fix_queue SET status = ?, owner_note = COALESCE(?, owner_note), updated_at = ? WHERE id = ?",
+    status,
+    ownerNote,
+    now,
+    id
+  );
+}
+
+export async function getFixQueueEntry(db, id) {
+  return db.get("SELECT * FROM fix_queue WHERE id = ?", id);
+}
+
+export async function addOwnerAuditLog(db, actorId, command, targetId = null, payload = null) {
+  const now = new Date().toISOString();
+  await db.run(
+    `INSERT INTO owner_audit_logs (created_at, actor_id, command, target_id, payload)
+     VALUES (?, ?, ?, ?, ?)`,
+    now,
+    actorId,
+    command,
+    targetId,
+    payload
+  );
+}
+
+export async function listOwnerAuditLogs(db, limit = 20) {
+  return db.all(
+    `SELECT * FROM owner_audit_logs ORDER BY id DESC LIMIT ?`,
+    limit
+  );
+}
+
+export async function getCommandHelpEntry(db, cmd) {
+  return db.get("SELECT * FROM command_help WHERE cmd = ?", cmd.toLowerCase());
+}
+
+export async function listCommandHelpEntries(db, mode = "all") {
+  if (mode === "owner") {
+    return db.all("SELECT * FROM command_help WHERE owner_only = 1 ORDER BY cmd ASC");
+  }
+  if (mode === "public") {
+    return db.all("SELECT * FROM command_help WHERE owner_only = 0 ORDER BY cmd ASC");
+  }
+  return db.all("SELECT * FROM command_help ORDER BY cmd ASC");
+}
+
+export async function searchCommandHelpEntries(db, query) {
+  const q = `%${query.toLowerCase()}%`;
+  return db.all(
+    `SELECT * FROM command_help
+     WHERE lower(cmd) LIKE ?
+        OR lower(usage) LIKE ?
+        OR lower(purpose) LIKE ?
+        OR lower(COALESCE(tips, '')) LIKE ?
+     ORDER BY cmd ASC`,
+    q,
+    q,
+    q,
+    q
+  );
+}
+
+export async function upsertCommandHelpEntry(db, cmd, usage, purpose, tips, ownerOnly) {
+  const now = new Date().toISOString();
+  await db.run(
+    `INSERT INTO command_help (cmd, usage, purpose, tips, owner_only, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(cmd) DO UPDATE SET
+       usage = excluded.usage,
+       purpose = excluded.purpose,
+       tips = excluded.tips,
+       owner_only = excluded.owner_only,
+       updated_at = excluded.updated_at`,
+    cmd.toLowerCase(),
+    usage,
+    purpose,
+    tips || null,
+    ownerOnly ? 1 : 0,
+    now,
+    now
+  );
+}
+
+export async function deleteCommandHelpEntry(db, cmd) {
+  await db.run("DELETE FROM command_help WHERE cmd = ?", cmd.toLowerCase());
 }
 
 export async function setBalance(db, chatId, phn) {

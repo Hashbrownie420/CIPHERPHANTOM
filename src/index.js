@@ -56,6 +56,20 @@ import {
   updateOwnerTodo,
   deleteOwnerTodo,
   setOwnerTodoStatus,
+  upsertErrorLog,
+  listErrorLogs,
+  getErrorLogById,
+  addFixQueueEntry,
+  listFixQueue,
+  updateFixQueueStatus,
+  getFixQueueEntry,
+  addOwnerAuditLog,
+  listOwnerAuditLogs,
+  getCommandHelpEntry,
+  listCommandHelpEntries,
+  searchCommandHelpEntries,
+  upsertCommandHelpEntry,
+  deleteCommandHelpEntry,
 } from "./db.js";
 
 // Pfad-Utilities fuer ES Modules (kein __dirname von Haus aus)
@@ -66,6 +80,7 @@ const __dirname = path.dirname(__filename);
 const DATA_DIR = path.resolve(__dirname, "..", "data");
 const PREFIX_FILE = path.join(DATA_DIR, "prefixes.json");
 const INBOX_DIR = path.join(DATA_DIR, "inbox");
+const ERROR_EXPORT_DIR = path.join(DATA_DIR, "errors");
 const AUTH_DIR = path.resolve(__dirname, "..", "auth");
 const CURRENCY = "PHN";
 const CURRENCY_NAME = "Phantoms";
@@ -84,6 +99,13 @@ const blackjackSessions = new Map();
 const stackerSessions = new Map();
 const CHAR_PRICE = 500;
 const WORK_COOLDOWN_HOURS = 3;
+let runtimeDb = null;
+let runtimeSock = null;
+let messageCutoffSec = 0;
+let lastDisconnectInfo = null;
+let startupSelftestIssues = [];
+let startupSelftestSent = false;
+const BOOT_TS = Date.now();
 
 // Einfache ANSI-Farben fuer Terminal-Ausgabe
 const COLORS = {
@@ -133,6 +155,93 @@ function log(type, msg) {
   console.log(line);
 }
 
+function formatError(err) {
+  if (!err) return "unknown error";
+  if (err instanceof Error) {
+    return err.stack || `${err.name}: ${err.message}`;
+  }
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
+}
+
+function makeErrorId() {
+  const rand = Math.random().toString(36).slice(2, 8).toUpperCase();
+  return `ERR-${Date.now().toString(36).toUpperCase()}-${rand}`;
+}
+
+function inferSeverity(source, err) {
+  if (source === "startup" || source === "uncaught_exception") return "fatal";
+  if (source === "reconnect" || source === "unhandled_rejection") return "error";
+  if (source === "error_notify_user") return "warn";
+  if (err instanceof Error && /timeout|network|socket/i.test(err.message)) return "warn";
+  return "error";
+}
+
+function makeErrorFingerprint(source, command, errorText) {
+  return `${source}|${command || "-"}|${errorText}`.slice(0, 900);
+}
+
+async function recordError(source, err, command = null, chatId = null) {
+  const errorText = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+  const errorStack = err instanceof Error ? err.stack : null;
+  const severity = inferSeverity(source, err);
+  const fingerprint = makeErrorFingerprint(source, command, errorText);
+  const newErrorId = makeErrorId();
+  let persisted = { errorId: newErrorId, deduped: false, occurrences: 1, lastSeenAt: new Date().toISOString() };
+
+  try {
+    if (runtimeDb) {
+      persisted = await upsertErrorLog(
+        runtimeDb,
+        newErrorId,
+        severity,
+        source,
+        command,
+        chatId,
+        fingerprint,
+        errorText,
+        errorStack,
+      );
+    }
+  } catch (dbErr) {
+    log("error", `[${newErrorId}] Fehler beim Speichern in DB: ${formatError(dbErr)}`);
+  }
+
+  const errorId = persisted.errorId || newErrorId;
+  log(
+    "error",
+    `[${errorId}] severity=${severity} count=${persisted.occurrences || 1} ${source} | cmd=${command || "-"} | chat=${chatId || "-"} | ${errorText}`,
+  );
+  if (errorStack && !persisted.deduped) {
+    log("error", `[${errorId}] stack: ${errorStack}`);
+  }
+
+  if (runtimeSock) {
+    const ownerMsg = [
+      `Fehler-ID: ${errorId}`,
+      `Zeit: ${formatDateTime(persisted.lastSeenAt || new Date().toISOString())}`,
+      `Severity: ${severity}`,
+      `Count: ${persisted.occurrences || 1}`,
+      `Quelle: ${source}`,
+      `Befehl: ${command || "-"}`,
+      `Chat: ${chatId || "-"}`,
+      `Fehler: ${errorText}`,
+    ];
+    for (const ownerId of OWNER_IDS) {
+      try {
+        await sendPlain(runtimeSock, ownerId, "Bot-Fehler", ownerMsg, "", "⚠️");
+      } catch {
+        // Owner-Notify darf nie den eigentlichen Fehlerfluss blockieren
+      }
+    }
+  }
+
+  return errorId;
+}
+
 function formatMessage(title, lines = [], footer = "", emoji = "ℹ️") {
   let out = `${emoji} ${title}`;
   if (lines.length) {
@@ -159,6 +268,77 @@ async function sendPlain(sock, chatId, title, lines, footer, emoji) {
 async function syncDb(db) {
   if (!db) return;
   await db.exec("PRAGMA wal_checkpoint(PASSIVE)");
+}
+
+async function runStartupSelftest(db) {
+  const issues = [];
+  const requiredDirs = [DATA_DIR, INBOX_DIR, ERROR_EXPORT_DIR];
+  for (const dir of requiredDirs) {
+    try {
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.accessSync(dir, fs.constants.W_OK);
+    } catch (err) {
+      issues.push(`Ordner nicht beschreibbar: ${dir} (${formatError(err)})`);
+    }
+  }
+
+  try {
+    const requiredTables = ["users", "quests", "error_logs", "owner_todos", "fix_queue", "owner_audit_logs"];
+    const rows = await db.all("SELECT name FROM sqlite_master WHERE type='table'");
+    const names = new Set(rows.map((r) => r.name));
+    for (const t of requiredTables) {
+      if (!names.has(t)) issues.push(`Tabelle fehlt: ${t}`);
+    }
+  } catch (err) {
+    issues.push(`Tabellenpruefung fehlgeschlagen: ${formatError(err)}`);
+  }
+
+  try {
+    const cols = await db.all("PRAGMA table_info(users)");
+    const names = new Set(cols.map((c) => c.name));
+    for (const c of ["wallet_address", "user_role", "level_role"]) {
+      if (!names.has(c)) issues.push(`users.${c} fehlt`);
+    }
+  } catch (err) {
+    issues.push(`Spaltenpruefung fehlgeschlagen: ${formatError(err)}`);
+  }
+
+  return issues;
+}
+
+const OWNER_AUDIT_COMMANDS = new Set([
+  "chatid",
+  "syncroles",
+  "dbdump",
+  "ban",
+  "unban",
+  "bans",
+  "setphn",
+  "purge",
+  "todo",
+  "errors",
+  "error",
+  "errorfile",
+  "sendpc",
+  "pcupload",
+  "health",
+  "fix",
+  "audits",
+  "helpadd",
+  "helpedit",
+  "helpdel",
+  "helplist",
+]);
+
+async function auditOwnerCommand(db, senderId, cmd, args, chatId) {
+  if (!isOwner(senderId) || !OWNER_AUDIT_COMMANDS.has(cmd)) return;
+  const target = args?.[0] || null;
+  const payload = JSON.stringify({ args: args || [], chatId });
+  try {
+    await addOwnerAuditLog(db, senderId, cmd, target, payload);
+  } catch (err) {
+    await recordError("owner_audit", err, cmd, chatId);
+  }
 }
 
 // Bytes menschenlesbar formatieren (KB/MB/GB)
@@ -1264,10 +1444,16 @@ async function start() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(PREFIX_FILE)) savePrefixes({});
   if (!fs.existsSync(INBOX_DIR)) fs.mkdirSync(INBOX_DIR, { recursive: true });
+  if (!fs.existsSync(ERROR_EXPORT_DIR)) fs.mkdirSync(ERROR_EXPORT_DIR, { recursive: true });
 
   printBanner();
+  // Alles vor diesem Zeitpunkt gilt als Altlast und wird ignoriert
+  messageCutoffSec = Math.floor(Date.now() / 1000) - 2;
 
   const db = await initDb();
+  runtimeDb = db;
+  startupSelftestIssues = await runStartupSelftest(db);
+  startupSelftestSent = false;
 
   // Baileys internes Logging deaktivieren
   const logger = P({ level: "silent" });
@@ -1282,6 +1468,7 @@ async function start() {
     logger,
     auth: state,
   });
+  runtimeSock = sock;
 
   // Jede Antwort mit DB-Sync absichern (immer vor dem Senden)
   const rawSendMessage = sock.sendMessage.bind(sock);
@@ -1301,19 +1488,59 @@ async function start() {
       qrcode.generate(qr, { small: true });
     }
     if (connection === "close") {
-      const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !==
-        DisconnectReason.loggedOut;
-      log("close", `Verbindung geschlossen. Reconnect: ${shouldReconnect}`);
-      if (shouldReconnect) start();
+      const statusCode =
+        lastDisconnect?.error?.output?.statusCode ??
+        lastDisconnect?.error?.statusCode ??
+        "unknown";
+      const reasonName =
+        Object.entries(DisconnectReason).find(([, code]) => code === statusCode)?.[0] ??
+        "unknown";
+      const errorMsg = lastDisconnect?.error?.message || "kein Fehlertext";
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      lastDisconnectInfo = {
+        at: new Date().toISOString(),
+        code: String(statusCode),
+        reason: reasonName,
+        error: errorMsg,
+        reconnect: shouldReconnect,
+      };
+      log(
+        "close",
+        `Verbindung geschlossen. code=${statusCode} reason=${reasonName} reconnect=${shouldReconnect} error="${errorMsg}"`,
+      );
+      if (shouldReconnect) {
+        start().catch((err) => {
+          recordError("reconnect", err).catch(() => {});
+        });
+      }
     }
-    if (connection === "open") log("open", "Verbunden");
+    if (connection === "open") {
+      log("open", "Verbunden");
+      if (startupSelftestIssues.length > 0 && !startupSelftestSent) {
+        startupSelftestSent = true;
+        const lines = ["Selftest hat Probleme gefunden:", ...startupSelftestIssues.slice(0, 12)];
+        for (const ownerId of OWNER_IDS) {
+          sendPlain(sock, ownerId, "Startup-Selftest", lines, "", "⚠️").catch(() => {});
+        }
+      }
+    }
   });
 
   // Eingehende Nachrichten behandeln
   sock.ev.on("messages.upsert", async ({ messages }) => {
     const m = messages?.[0];
     if (!m || m.key.fromMe) return;
+    try {
+    const tsRaw = m.messageTimestamp;
+    const tsNum =
+      typeof tsRaw === "bigint"
+        ? Number(tsRaw)
+        : typeof tsRaw === "object" && tsRaw?.low != null
+          ? Number(tsRaw.low)
+          : Number(tsRaw);
+    if (Number.isFinite(tsNum) && tsNum > 0 && tsNum < messageCutoffSec) {
+      return;
+    }
 
     // Chat-ID und Nachrichtentext
     const chatId = m.key.remoteJid;
@@ -1364,8 +1591,9 @@ async function start() {
 
     const { cmd, args } = parsed;
     log("cmd", `Befehl: ${cmd} | Chat: ${chatId}`);
+    await auditOwnerCommand(db, senderId, cmd, args, chatId);
 
-    const publicCmds = new Set(["help", "register", "dsgvo", "accept"]);
+    const publicCmds = new Set(["menu", "help", "helpsearch", "register", "dsgvo", "accept"]);
 
     const user = await getUser(db, chatId);
     const preAccept = await getPreDsgvoAccepted(db, chatId);
@@ -1417,7 +1645,7 @@ async function start() {
         await sendText(sock, chatId, m, "Pong", ["Bot ist online."], "", "🏓");
         break;
 
-      case "help":
+      case "menu":
         // Hilfe-Menue mit allen Befehlen anzeigen
         if (!user && !preAccept) {
           await sendText(
@@ -1461,46 +1689,73 @@ async function start() {
           m,
           `Befehle (Prefix: ${prefix})`,
           [
-            `${prefix}profile`,
-            `${prefix}xp`,
-            `${prefix}name <neuer_name>`,
-            `${prefix}wallet`,
-            `${prefix}pay <wallet_address> <betrag>`,
-            `${prefix}flip <betrag> <kopf|zahl>`,
-            `${prefix}slots <betrag>`,
-            `${prefix}roulette <betrag> <rot|schwarz|gerade|ungerade|zahl> [wert]`,
-            `${prefix}blackjack <betrag>|hit|stand`,
-            `${prefix}fish <betrag>`,
-            `${prefix}stacker <betrag>|cashout`,
-            `${prefix}char`,
-            `${prefix}buychar <name>`,
-            `${prefix}charname <neuer_name>`,
-            `${prefix}work`,
-            `${prefix}feed <snack|meal|feast>`,
-            `${prefix}med <small|big>`,
-            `${prefix}guide`,
-            `${prefix}daily`,
-            `${prefix}weekly`,
-            `${prefix}quests <daily|weekly|monthly|progress>`,
-            `${prefix}claim <quest_id>`,
-            `${prefix}friendcode`,
-            `${prefix}addfriend <code>`,
-            `${prefix}friends`,
-            `${prefix}delete`,
-            `${prefix}prefix <neues_prefix>`,
-            `${prefix}ping`,
+            "┏━ 👤 Profil",
+            `${prefix}profile  • Profilinfo`,
+            `${prefix}xp  • Levelstand`,
+            `${prefix}name <neuer_name>  • Name aendern`,
+            `${prefix}delete  • Account loeschen`,
+            "",
+            "┏━ 💰 Wallet",
+            `${prefix}wallet  • Kontostand`,
+            `${prefix}pay <wallet_address> <betrag>  • PHN senden`,
+            "",
+            "┏━ 🎮 Spiele",
+            `${prefix}flip <betrag> <kopf|zahl>  • Coinflip`,
+            `${prefix}slots <betrag>  • Slots`,
+            `${prefix}roulette <betrag> <rot|schwarz|gerade|ungerade|zahl> [wert]  • Roulette`,
+            `${prefix}blackjack <betrag>|hit|stand  • Blackjack`,
+            `${prefix}fish <betrag>  • Fishgame`,
+            `${prefix}stacker <betrag>|cashout  • Risiko-Spiel`,
+            "",
+            "┏━ 🧑 Charakter",
+            `${prefix}char  • Status`,
+            `${prefix}buychar <name>  • Charakter kaufen`,
+            `${prefix}charname <neuer_name>  • Charaktername`,
+            `${prefix}work  • Arbeiten`,
+            `${prefix}feed <snack|meal|feast>  • Fuettern`,
+            `${prefix}med <small|big>  • Medizin`,
+            "",
+            "┏━ 🎯 Fortschritt",
+            `${prefix}daily  • Tagesbonus`,
+            `${prefix}weekly  • Wochenbonus`,
+            `${prefix}quests <daily|weekly|monthly|progress>  • Questliste`,
+            `${prefix}claim <quest_id>  • Belohnung`,
+            "",
+            "┏━ 👥 Social",
+            `${prefix}friendcode  • Code zeigen`,
+            `${prefix}addfriend <code>  • Freund adden`,
+            `${prefix}friends  • Freundesliste`,
+            "",
+            "┏━ ⚙️ System",
+            `${prefix}guide  • Bot-Anleitung`,
+            `${prefix}help <befehl>  • Detailhilfe`,
+            `${prefix}helpsearch <text>  • Hilfe suchen`,
+            `${prefix}prefix <neues_prefix>  • Prefix setzen`,
+            `${prefix}ping  • Erreichbarkeit`,
             ...(isOwner(senderId)
               ? [
-                  `${prefix}chatid`,
-                  `${prefix}syncroles`,
-                  `${prefix}dbdump`,
-                  `${prefix}ban <id|@user> [dauer] [grund]`,
-                  `${prefix}unban <id|@user>`,
-                  `${prefix}bans`,
-                  `${prefix}setphn <id|@user> <betrag>`,
-                  `${prefix}purge <id|@user>`,
-                  `${prefix}todo <add|list|edit|done|del> ...`,
-                  `${prefix}sendpc <text|datei>`,
+                  "",
+                  "┏━ 🛡️ Owner",
+                  `${prefix}chatid  • Chat-ID`,
+                  `${prefix}syncroles  • Rollen sync`,
+                  `${prefix}dbdump  • DB Export`,
+                  `${prefix}ban <id|@user> [dauer] [grund]  • Nutzer sperren`,
+                  `${prefix}unban <id|@user>  • Sperre aufheben`,
+                  `${prefix}bans  • Sperrliste`,
+                  `${prefix}setphn <id|@user> <betrag>  • PHN setzen`,
+                  `${prefix}purge <id|@user>  • Profil entfernen`,
+                  `${prefix}todo <add|list|edit|done|del> ...  • Aufgaben`,
+                  `${prefix}errors [limit] [severity]  • Fehlerliste`,
+                  `${prefix}error <FEHLER-ID>  • Fehlerdetails`,
+                  `${prefix}errorfile <FEHLER-ID>  • Fehlerdatei`,
+                  `${prefix}fix <add|list|status> ...  • Fix-Queue`,
+                  `${prefix}audits [limit]  • Admin-Log`,
+                  `${prefix}health  • Botstatus`,
+                  `${prefix}sendpc <text|datei>  • Handy-Upload`,
+                  `${prefix}helpadd ...  • Help anlegen`,
+                  `${prefix}helpedit ...  • Help aendern`,
+                  `${prefix}helpdel <cmd>  • Help loeschen`,
+                  `${prefix}helplist [all|owner|public]  • Helpliste`,
                 ]
               : []),
           ],
@@ -1508,6 +1763,160 @@ async function start() {
           "📌",
         );
         break;
+
+      case "help": {
+        // Detailhilfe aus command_help Tabelle
+        const rawQuery = (args[0] || "").toLowerCase().trim();
+        const query = rawQuery.startsWith(prefix) ? rawQuery.slice(prefix.length) : rawQuery;
+        if (!query) {
+          await sendText(
+            sock,
+            chatId,
+            m,
+            "Help",
+            [`Usage: ${prefix}help <befehl>`, `Beispiel: ${prefix}help flip`],
+            "",
+            "ℹ️",
+          );
+          break;
+        }
+        const entry = await getCommandHelpEntry(db, query);
+        if (!entry) {
+          await sendText(sock, chatId, m, "Help", ["Kein Eintrag gefunden."], "", "⚠️");
+          break;
+        }
+        if (entry.owner_only && !isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Help", ["Dieser Befehl ist Owner only."], "", "🚫");
+          break;
+        }
+        await sendText(
+          sock,
+          chatId,
+          m,
+          `Help: ${entry.cmd}`,
+          [
+            `Verwendung: ${prefix}${entry.usage}`,
+            `Nutzen: ${entry.purpose}`,
+            `Tipps: ${entry.tips || "-"}`,
+            `Sichtbar: ${entry.owner_only ? "Owner" : "Alle"}`,
+          ],
+          "",
+          "📘",
+        );
+        break;
+      }
+
+      case "helpsearch": {
+        // Hilfeeintraege per Stichwort suchen
+        const query = args.join(" ").trim().toLowerCase();
+        if (!query) {
+          await sendText(
+            sock,
+            chatId,
+            m,
+            "Usage",
+            [`${prefix}helpsearch <stichwort>`],
+            "",
+            "ℹ️",
+          );
+          break;
+        }
+        const rows = await searchCommandHelpEntries(db, query);
+        const visible = rows.filter((r) => !r.owner_only || isOwner(senderId));
+        if (!visible.length) {
+          await sendText(sock, chatId, m, "Help-Suche", ["Keine Treffer."], "", "ℹ️");
+          break;
+        }
+        const lines = visible
+          .slice(0, 25)
+          .map((r) => `${r.cmd} | ${r.purpose}${r.owner_only ? " | owner" : ""}`);
+        await sendText(
+          sock,
+          chatId,
+          m,
+          `Help-Suche (${visible.length})`,
+          lines,
+          `Details: ${prefix}help <befehl>`,
+          "🔎",
+        );
+        break;
+      }
+
+      case "helpadd":
+      case "helpedit": {
+        // Owner: Hilfeeintrag anlegen/aendern
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        const raw = args.join(" ").trim();
+        const parts = raw.split("|").map((s) => s.trim());
+        if (parts.length < 3) {
+          await sendText(
+            sock,
+            chatId,
+            m,
+            "Usage",
+            [
+              `${prefix}${cmd} <cmd> | <usage> | <nutzen> | [tipps] | [owner_only]`,
+              `owner_only: true|false`,
+            ],
+            "",
+            "ℹ️",
+          );
+          break;
+        }
+        const helpCmd = parts[0].toLowerCase();
+        const usage = parts[1];
+        const purpose = parts[2];
+        const tips = parts[3] || null;
+        const ownerOnly = ["1", "true", "yes", "owner"].includes((parts[4] || "").toLowerCase());
+        await upsertCommandHelpEntry(db, helpCmd, usage, purpose, tips, ownerOnly);
+        await sendText(
+          sock,
+          chatId,
+          m,
+          "Help gespeichert",
+          [`cmd: ${helpCmd}`, `owner_only: ${ownerOnly ? "true" : "false"}`],
+          "",
+          "✅",
+        );
+        break;
+      }
+
+      case "helpdel": {
+        // Owner: Hilfeeintrag loeschen
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        const helpCmd = (args[0] || "").toLowerCase().trim();
+        if (!helpCmd) {
+          await sendText(sock, chatId, m, "Usage", [`${prefix}helpdel <cmd>`], "", "ℹ️");
+          break;
+        }
+        await deleteCommandHelpEntry(db, helpCmd);
+        await sendText(sock, chatId, m, "Help geloescht", [`cmd: ${helpCmd}`], "", "🗑️");
+        break;
+      }
+
+      case "helplist": {
+        // Owner: Hilfeeintraege listen
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        const modeRaw = (args[0] || "all").toLowerCase();
+        const mode = ["all", "public", "owner"].includes(modeRaw) ? modeRaw : "all";
+        const rows = await listCommandHelpEntries(db, mode);
+        if (!rows.length) {
+          await sendText(sock, chatId, m, "Help-Liste", ["Keine Eintraege."], "", "ℹ️");
+          break;
+        }
+        const lines = rows.map((r) => `${r.cmd} | ${r.owner_only ? "owner" : "public"} | ${r.purpose}`);
+        await sendText(sock, chatId, m, `Help-Liste (${mode}, ${rows.length})`, lines, "", "📚");
+        break;
+      }
 
       case "dsgvo": {
         // DSGVO Kurzinfo anzeigen
@@ -4339,6 +4748,248 @@ async function start() {
         break;
       }
 
+      case "errors": {
+        // Owner: letzte Fehler ausgeben
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        let limit = 10;
+        let severity = "all";
+        for (const a of args) {
+          const maybeNum = Number(a);
+          if (Number.isFinite(maybeNum) && maybeNum > 0) {
+            limit = Math.min(50, Math.floor(maybeNum));
+            continue;
+          }
+          const s = String(a || "").toLowerCase();
+          if (["all", "info", "warn", "error", "fatal"].includes(s)) {
+            severity = s;
+          }
+        }
+        const rows = await listErrorLogs(db, limit, severity);
+        if (!rows.length) {
+          await sendText(sock, chatId, m, "Fehler-Log", [`Keine Eintraege fuer severity='${severity}'.`], "", "ℹ️");
+          break;
+        }
+        const lines = rows.map((r) => {
+          const cmd = r.command || "-";
+          const chat = r.chat_id || "-";
+          return `${r.error_id} | ${r.severity} | x${r.occurrences} | ${formatDateTime(r.last_seen_at)} | ${r.source} | cmd=${cmd} | chat=${chat}`;
+        });
+        await sendText(sock, chatId, m, `Fehler-Log (letzte ${rows.length}, severity=${severity})`, lines, "", "🧾");
+        break;
+      }
+
+      case "error": {
+        // Owner: Fehlerdetails nach ID anzeigen
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        const errorId = (args[0] || "").trim();
+        if (!errorId) {
+          await sendText(sock, chatId, m, "Usage", [`${prefix}error <FEHLER-ID>`], "", "ℹ️");
+          break;
+        }
+        const row = await getErrorLogById(db, errorId);
+        if (!row) {
+          await sendText(sock, chatId, m, "Fehler", ["Fehler-ID nicht gefunden."], "", "⚠️");
+          break;
+        }
+        const stackPreview = row.error_stack
+          ? row.error_stack.split("\n").slice(0, 8).join("\n")
+          : "kein stack";
+        await sendText(
+          sock,
+          chatId,
+          m,
+          `Fehler ${row.error_id}`,
+          [
+            `Severity: ${row.severity}`,
+            `Erster Fehler: ${formatDateTime(row.first_seen_at)}`,
+            `Letzter Fehler: ${formatDateTime(row.last_seen_at)}`,
+            `Count: ${row.occurrences}`,
+            `Quelle: ${row.source}`,
+            `Befehl: ${row.command || "-"}`,
+            `Chat: ${row.chat_id || "-"}`,
+            `Meldung: ${row.error_message}`,
+            `Stack:\n${stackPreview}`,
+            `Fix-Queue: ${prefix}fix add ${row.error_id} <notiz>`,
+          ],
+          "",
+          "🧾",
+        );
+        break;
+      }
+
+      case "errorfile": {
+        // Owner: Fehler als Datei exportieren
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        const errorId = (args[0] || "").trim();
+        if (!errorId) {
+          await sendText(sock, chatId, m, "Usage", [`${prefix}errorfile <FEHLER-ID>`], "", "ℹ️");
+          break;
+        }
+        const row = await getErrorLogById(db, errorId);
+        if (!row) {
+          await sendText(sock, chatId, m, "Fehler", ["Fehler-ID nicht gefunden."], "", "⚠️");
+          break;
+        }
+        const content =
+          `Fehler-ID: ${row.error_id}\n` +
+          `Severity: ${row.severity}\n` +
+          `Erster Fehler: ${row.first_seen_at}\n` +
+          `Letzter Fehler: ${row.last_seen_at}\n` +
+          `Count: ${row.occurrences}\n` +
+          `Quelle: ${row.source}\n` +
+          `Befehl: ${row.command || "-"}\n` +
+          `Chat: ${row.chat_id || "-"}\n` +
+          `Meldung: ${row.error_message}\n\n` +
+          `Stack:\n${row.error_stack || "kein stack"}`;
+        const fileName = `${row.error_id}.txt`;
+        const filePath = path.join(ERROR_EXPORT_DIR, fileName);
+        fs.writeFileSync(filePath, content, "utf8");
+        await sock.sendMessage(
+          chatId,
+          {
+            document: fs.readFileSync(filePath),
+            fileName,
+            mimetype: "text/plain",
+            caption: `Fehlerexport ${row.error_id}`,
+          },
+          { quoted: m },
+        );
+        break;
+      }
+
+      case "fix": {
+        // Owner: Fehler -> Fix-Queue
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        const action = (args[0] || "").toLowerCase();
+        if (!action || !["add", "list", "status"].includes(action)) {
+          await sendText(
+            sock,
+            chatId,
+            m,
+            "Usage",
+            [
+              `${prefix}fix add <FEHLER-ID> <notiz>`,
+              `${prefix}fix list [open|in_progress|done|all] [limit]`,
+              `${prefix}fix status <id> <open|in_progress|done> [notiz]`,
+            ],
+            "",
+            "ℹ️",
+          );
+          break;
+        }
+        if (action === "add") {
+          const errorId = (args[1] || "").trim();
+          const note = args.slice(2).join(" ").trim();
+          if (!errorId) {
+            await sendText(sock, chatId, m, "Usage", [`${prefix}fix add <FEHLER-ID> <notiz>`], "", "ℹ️");
+            break;
+          }
+          const errRow = await getErrorLogById(db, errorId);
+          if (!errRow) {
+            await sendText(sock, chatId, m, "Fehler", ["Fehler-ID nicht gefunden."], "", "⚠️");
+            break;
+          }
+          await addFixQueueEntry(db, errorId, note || null, senderId);
+          await sendText(sock, chatId, m, "Fix-Queue", [`Hinzugefuegt: ${errorId}`, `Notiz: ${note || "-"}`], "", "✅");
+          break;
+        }
+        if (action === "list") {
+          let status = "open";
+          let limit = 20;
+          for (const a of args.slice(1)) {
+            const s = String(a).toLowerCase();
+            const n = Number(a);
+            if (["open", "in_progress", "done", "all"].includes(s)) status = s;
+            if (Number.isFinite(n) && n > 0) limit = Math.min(50, Math.floor(n));
+          }
+          const rows = await listFixQueue(db, status, limit);
+          if (!rows.length) {
+            await sendText(sock, chatId, m, "Fix-Queue", [`Keine Eintraege fuer '${status}'.`], "", "ℹ️");
+            break;
+          }
+          const lines = rows.map((r) => `#${r.id} | ${r.status} | ${r.error_id} | ${formatDateTime(r.updated_at)}${r.owner_note ? `\n${r.owner_note}` : ""}`);
+          await sendText(sock, chatId, m, `Fix-Queue (${rows.length})`, lines, "", "🛠️");
+          break;
+        }
+        const id = Number(args[1]);
+        const status = (args[2] || "").toLowerCase();
+        const note = args.slice(3).join(" ").trim();
+        if (!Number.isInteger(id) || id <= 0 || !["open", "in_progress", "done"].includes(status)) {
+          await sendText(sock, chatId, m, "Usage", [`${prefix}fix status <id> <open|in_progress|done> [notiz]`], "", "ℹ️");
+          break;
+        }
+        const row = await getFixQueueEntry(db, id);
+        if (!row) {
+          await sendText(sock, chatId, m, "Fehler", ["Fix-ID nicht gefunden."], "", "⚠️");
+          break;
+        }
+        await updateFixQueueStatus(db, id, status, note || null);
+        await sendText(sock, chatId, m, "Fix-Queue aktualisiert", [`#${id} -> ${status}`, `Notiz: ${note || "-"}`], "", "✅");
+        break;
+      }
+
+      case "audits": {
+        // Owner: Audit-Log owner Befehle
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        const reqLimit = Number(args[0]);
+        const limit = Number.isFinite(reqLimit) && reqLimit > 0 ? Math.min(50, Math.floor(reqLimit)) : 20;
+        const rows = await listOwnerAuditLogs(db, limit);
+        if (!rows.length) {
+          await sendText(sock, chatId, m, "Owner-Audits", ["Keine Eintraege vorhanden."], "", "ℹ️");
+          break;
+        }
+        const lines = rows.map((r) => `${formatDateTime(r.created_at)} | ${r.actor_id} | ${r.command} | target=${r.target_id || "-"}`);
+        await sendText(sock, chatId, m, `Owner-Audits (${rows.length})`, lines, "", "🧾");
+        break;
+      }
+
+      case "health": {
+        // Owner: Bot-Health/Selftest/Queues
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        const [usersRow, errorsRow, fixesRow] = await Promise.all([
+          db.get("SELECT COUNT(*) AS c FROM users"),
+          db.get("SELECT COUNT(*) AS c FROM error_logs"),
+          db.get("SELECT COUNT(*) AS c FROM fix_queue WHERE status IN ('open','in_progress')"),
+        ]);
+        const used = process.memoryUsage().rss;
+        const total = os.totalmem();
+        const uptime = formatUptime(process.uptime());
+        const lines = [
+          `Uptime: ${uptime}`,
+          `RAM: ${formatBytes(used)} / ${formatBytes(total)}`,
+          `Users: ${usersRow?.c ?? 0}`,
+          `Error-Logs: ${errorsRow?.c ?? 0}`,
+          `Fix-Queue offen: ${fixesRow?.c ?? 0}`,
+          `Pending NameChanges: ${pendingNameChanges.size}`,
+          `Pending Deletes: ${pendingDeletes.size}`,
+          `Pending Purchases: ${pendingPurchases.size}`,
+          `Stacker Sessions: ${stackerSessions.size}`,
+          `Blackjack Sessions: ${blackjackSessions.size}`,
+          `Selftest Issues: ${startupSelftestIssues.length}`,
+          `Last Disconnect: ${lastDisconnectInfo ? `${formatDateTime(lastDisconnectInfo.at)} | ${lastDisconnectInfo.reason} (${lastDisconnectInfo.code})` : "-"}`,
+        ];
+        await sendText(sock, chatId, m, "Health", lines, "", "🩺");
+        break;
+      }
+
       case "sendpc":
       case "pcupload": {
         // Owner: Text/Datei vom Handy auf den Laptop speichern
@@ -4576,13 +5227,49 @@ async function start() {
           chatId,
           m,
           "Unbekannter Befehl",
-          [`${prefix}help fuer Hilfe`],
+          [`${prefix}menu fuer Hilfe`],
           "",
           "❓",
         );
         break;
     }
+    } catch (err) {
+      const chatId = m.key?.remoteJid;
+      const body = getText(m.message);
+      let cmdFromBody = null;
+      if (chatId && body) {
+        const prefixes = loadPrefixes();
+        const prefix = prefixes[chatId] || "-";
+        const parsed = parseCommand(body, prefix);
+        cmdFromBody = parsed?.cmd || null;
+      }
+      const errorId = await recordError("command_handler", err, cmdFromBody, chatId);
+      if (chatId) {
+        try {
+          await sendPlain(
+            sock,
+            chatId,
+            "Interner Fehler",
+            ["Beim Verarbeiten ist ein Fehler aufgetreten.", `Fehler-ID: ${errorId}`],
+            "",
+            "⚠️",
+          );
+        } catch (notifyErr) {
+          await recordError("error_notify_user", notifyErr, cmdFromBody, chatId);
+        }
+      }
+    }
   });
 }
 
-start();
+process.on("unhandledRejection", (reason) => {
+  recordError("unhandled_rejection", reason instanceof Error ? reason : new Error(formatError(reason))).catch(() => {});
+});
+
+process.on("uncaughtException", (err) => {
+  recordError("uncaught_exception", err).catch(() => {});
+});
+
+start().catch((err) => {
+  recordError("startup", err).catch(() => {});
+});
