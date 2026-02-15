@@ -11,12 +11,17 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import os from "os";
+import crypto from "crypto";
+import { execFile, spawn } from "child_process";
+import { promisify } from "util";
 import PDFDocument from "pdfkit";
 import {
   initDb,
   getUser,
   createUser,
   setProfileName,
+  setUserProfilePhoto,
+  setUserBiography,
   setBalance,
   addBalance,
   addXp,
@@ -35,6 +40,7 @@ import {
   getFriendByCode,
   addFriend,
   listFriends,
+  listUsers,
   listQuests,
   getQuestByKey,
   ensureUserQuest,
@@ -65,11 +71,19 @@ import {
   getFixQueueEntry,
   addOwnerAuditLog,
   listOwnerAuditLogs,
+  upsertKnownChat,
+  listKnownChats,
+  addOwnerOutboxMessage,
+  listPendingOwnerOutbox,
+  markOwnerOutboxSent,
+  markOwnerOutboxFailed,
+  listOwnerOutbox,
   getCommandHelpEntry,
   listCommandHelpEntries,
   searchCommandHelpEntries,
   upsertCommandHelpEntry,
   deleteCommandHelpEntry,
+  upsertOwnerPasswordHash,
 } from "./db.js";
 
 // Pfad-Utilities fuer ES Modules (kein __dirname von Haus aus)
@@ -81,6 +95,19 @@ const DATA_DIR = path.resolve(__dirname, "..", "data");
 const PREFIX_FILE = path.join(DATA_DIR, "prefixes.json");
 const INBOX_DIR = path.join(DATA_DIR, "inbox");
 const ERROR_EXPORT_DIR = path.join(DATA_DIR, "errors");
+const AVATAR_DIR = path.join(DATA_DIR, "avatars");
+const OWNER_ANDROID_DIR = path.resolve(__dirname, "..", "owner-app", "android");
+const OWNER_LOCAL_PROPERTIES = path.join(OWNER_ANDROID_DIR, "local.properties");
+const OWNER_APK_PATH = path.join(
+  OWNER_ANDROID_DIR,
+  "app",
+  "build",
+  "outputs",
+  "apk",
+  "debug",
+  "app-debug.apk",
+);
+const OWNER_APP_URL_STATE_FILE = path.join(DATA_DIR, "owner-app-url-state.json");
 const AUTH_DIR = path.resolve(__dirname, "..", "auth");
 const CURRENCY = "PHN";
 const CURRENCY_NAME = "Phantoms";
@@ -106,6 +133,11 @@ let lastDisconnectInfo = null;
 let startupSelftestIssues = [];
 let startupSelftestSent = false;
 const BOOT_TS = Date.now();
+let ownerOutboxTimer = null;
+let ownerOutboxBusy = false;
+const execFileAsync = promisify(execFile);
+let ownerApkWatcherTimer = null;
+let ownerApkBuildRunning = false;
 
 // Einfache ANSI-Farben fuer Terminal-Ausgabe
 const COLORS = {
@@ -170,6 +202,574 @@ function formatError(err) {
 function makeErrorId() {
   const rand = Math.random().toString(36).slice(2, 8).toUpperCase();
   return `ERR-${Date.now().toString(36).toUpperCase()}-${rand}`;
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizePhoneDigits(value) {
+  return String(value || "").replace(/[^0-9]/g, "");
+}
+
+function phoneToJid(value) {
+  const digits = normalizePhoneDigits(value);
+  if (!digits) return "";
+  return `${digits}@s.whatsapp.net`;
+}
+
+function normalizeTargetToJid(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (raw.includes("@")) return raw;
+  return phoneToJid(raw);
+}
+
+async function syncUserAvatar(db, sock, chatId) {
+  if (!chatId || !chatId.includes("@")) return;
+  try {
+    await saveAvatarForChat(db, sock, chatId);
+  } catch {
+    // ignore (private/no profile image/restricted)
+  }
+}
+
+async function syncUserBiography(db, sock, userChatId, candidates = []) {
+  if (!userChatId || !String(userChatId).includes("@")) return;
+  const tryIds = [];
+  const addTry = (v) => {
+    const t = String(v || "").trim();
+    if (!t || !t.includes("@")) return;
+    if (!tryIds.includes(t)) tryIds.push(t);
+  };
+  addTry(userChatId);
+  for (const c of candidates) addTry(c);
+  for (const c of [...tryIds]) {
+    if (c.endsWith("@lid")) {
+      addTry(c.replace(/@lid$/i, "@s.whatsapp.net"));
+    }
+  }
+  for (const c of [...tryIds]) {
+    const digits = normalizePhoneDigits(c);
+    if (!digits) continue;
+    try {
+      const exists = await sock.onWhatsApp(digits);
+      for (const row of exists || []) {
+        if (row?.jid) addTry(row.jid);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  // Prefer a real existing users.chat_id row for storage.
+  let targetChatId = "";
+  for (const jid of tryIds) {
+    const u = await getUser(db, jid);
+    if (u?.chat_id) {
+      targetChatId = u.chat_id;
+      break;
+    }
+  }
+  if (!targetChatId) {
+    for (const jid of tryIds) {
+      const digits = normalizePhoneDigits(jid);
+      if (!digits) continue;
+      const row = await db.get(
+        "SELECT chat_id FROM users WHERE chat_id LIKE ? OR chat_id LIKE ? LIMIT 1",
+        `${digits}%@s.whatsapp.net`,
+        `${digits}%@lid`
+      );
+      if (row?.chat_id) {
+        targetChatId = row.chat_id;
+        break;
+      }
+    }
+  }
+  if (!targetChatId) {
+    targetChatId = userChatId;
+  }
+
+  for (const jid of tryIds) {
+    try {
+      const st = await sock.fetchStatus(jid);
+      const bio = String(st?.status || "").trim();
+      if (!bio) continue;
+      await setUserBiography(db, targetChatId, bio);
+      log("cmd", `Bio aktualisiert fuer ${targetChatId} (via ${jid})`);
+      return;
+    } catch {
+      // try next jid variant
+    }
+  }
+}
+
+async function debugUserBiographyFetch(db, sock, userChatId, candidates = []) {
+  const tryIds = [];
+  const addTry = (v) => {
+    const t = String(v || "").trim();
+    if (!t || !t.includes("@")) return;
+    if (!tryIds.includes(t)) tryIds.push(t);
+  };
+  addTry(userChatId);
+  for (const c of candidates) addTry(c);
+  for (const c of [...tryIds]) {
+    if (c.endsWith("@lid")) addTry(c.replace(/@lid$/i, "@s.whatsapp.net"));
+  }
+  for (const c of [...tryIds]) {
+    const digits = normalizePhoneDigits(c);
+    if (!digits) continue;
+    try {
+      const exists = await sock.onWhatsApp(digits);
+      for (const row of exists || []) {
+        if (row?.jid) addTry(row.jid);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  const lines = [`Ziel: ${userChatId}`, `Kandidaten: ${tryIds.length}`];
+  let savedBio = "";
+  let savedVia = "";
+  for (const jid of tryIds) {
+    try {
+      const st = await sock.fetchStatus(jid);
+      const bio = String(st?.status || "").trim();
+      lines.push(`${jid} => ${bio || "<leer>"}`);
+      if (!savedBio && bio) {
+        savedBio = bio;
+        savedVia = jid;
+      }
+    } catch (err) {
+      lines.push(`${jid} => FEHLER: ${String(err?.message || err || "unknown").slice(0, 120)}`);
+    }
+  }
+  if (savedBio) {
+    await setUserBiography(db, userChatId, savedBio);
+    lines.push(`Gespeichert via: ${savedVia}`);
+  } else {
+    lines.push("Keine Bio aus fetchStatus erhalten.");
+  }
+  return lines;
+}
+
+function avatarExtFromMime(mime, fallback = ".jpg") {
+  const m = String(mime || "").toLowerCase();
+  if (m.includes("png")) return ".png";
+  if (m.includes("webp")) return ".webp";
+  if (m.includes("jpeg") || m.includes("jpg")) return ".jpg";
+  if (m.includes("gif")) return ".gif";
+  return fallback;
+}
+
+async function saveAvatarForChat(db, sock, chatId) {
+  const picUrl = await sock.profilePictureUrl(chatId, "image");
+  if (!picUrl) throw new Error("Kein Profilbild gefunden.");
+  const res = await fetch(picUrl);
+  if (!res.ok) throw new Error(`Profilbild Download fehlgeschlagen (${res.status})`);
+  const arr = await res.arrayBuffer();
+  const buf = Buffer.from(arr);
+  if (!buf.length) throw new Error("Leeres Profilbild.");
+  if (!fs.existsSync(AVATAR_DIR)) fs.mkdirSync(AVATAR_DIR, { recursive: true });
+  const ext = avatarExtFromMime(res.headers.get("content-type"), ".jpg");
+  const safeId = String(chatId).replace(/[^a-zA-Z0-9._-]/g, "_");
+  const userDir = path.join(AVATAR_DIR, safeId);
+  if (!fs.existsSync(userDir)) fs.mkdirSync(userDir, { recursive: true });
+  const hash = crypto.createHash("sha1").update(buf).digest("hex").slice(0, 16);
+  const fileName = `avatar-${hash}${ext}`;
+  const filePath = path.join(userDir, fileName);
+
+  const existing = fs
+    .readdirSync(userDir, { withFileTypes: true })
+    .filter((d) => d.isFile())
+    .map((d) => d.name);
+  const hasSameFile = existing.includes(fileName);
+
+  if (!hasSameFile) {
+    fs.writeFileSync(filePath, buf);
+  }
+
+  const publicPath = `/media/avatar/${encodeURIComponent(safeId)}/${encodeURIComponent(fileName)}`;
+  await setUserProfilePhoto(db, chatId, publicPath);
+  return { publicPath, filePath, size: buf.length, changed: !hasSameFile };
+}
+
+async function runPm2(args) {
+  try {
+    const { stdout, stderr } = await execFileAsync("pm2", args, { maxBuffer: 1024 * 1024 * 8 });
+    return { ok: true, stdout: String(stdout || ""), stderr: String(stderr || "") };
+  } catch (err) {
+    return {
+      ok: false,
+      stdout: String(err?.stdout || ""),
+      stderr: String(err?.stderr || err?.message || "pm2 failed"),
+    };
+  }
+}
+
+async function getPm2Proc(name) {
+  const res = await runPm2(["jlist"]);
+  if (!res.ok) return null;
+  try {
+    const list = JSON.parse(res.stdout || "[]");
+    return list.find((p) => p?.name === name) || null;
+  } catch {
+    return null;
+  }
+}
+
+function tailFileSafe(filePath, lines = 40) {
+  try {
+    if (!fs.existsSync(filePath)) return "";
+    const all = fs.readFileSync(filePath, "utf8").split("\n");
+    return all.slice(-lines).join("\n");
+  } catch {
+    return "";
+  }
+}
+
+function readOwnerLocalProperties() {
+  try {
+    if (!fs.existsSync(OWNER_LOCAL_PROPERTIES)) {
+      return { appUrl: "", versionCode: 0, apkDownloadUrl: "" };
+    }
+    const txt = fs.readFileSync(OWNER_LOCAL_PROPERTIES, "utf8");
+    const appUrl = (txt.match(/^OWNER_APP_URL=(.+)$/m)?.[1] || "").trim();
+    const versionCode = Number((txt.match(/^OWNER_APK_VERSION_CODE=(.+)$/m)?.[1] || "0").trim()) || 0;
+    const apkDownloadUrl = (txt.match(/^OWNER_APK_DOWNLOAD_URL=(.+)$/m)?.[1] || "").trim();
+    return { appUrl, versionCode, apkDownloadUrl };
+  } catch {
+    return { appUrl: "", versionCode: 0, apkDownloadUrl: "" };
+  }
+}
+
+function parseOwnerVersionCode(versionCode) {
+  const code = Math.max(0, Number(versionCode || 0) || 0);
+  const major = Math.floor(code / 10000);
+  const minor = Math.floor((code % 10000) / 100);
+  const patch = code % 100;
+  return { major, minor, patch, code };
+}
+
+function composeOwnerVersionCode(major, minor, patch) {
+  const safeMajor = Math.max(0, Number(major || 0) || 0);
+  const safeMinor = Math.max(0, Math.min(99, Number(minor || 0) || 0));
+  const safePatch = Math.max(0, Math.min(99, Number(patch || 0) || 0));
+  return safeMajor * 10000 + safeMinor * 100 + safePatch;
+}
+
+function formatOwnerVersion(versionCode) {
+  const v = parseOwnerVersionCode(versionCode);
+  return `v${v.major}.${v.minor}.${v.patch}`;
+}
+
+function bumpOwnerVersionCode(versionCode, bumpType = "patch") {
+  const current = parseOwnerVersionCode(versionCode);
+  let { major, minor, patch } = current;
+  const t = String(bumpType || "patch").toLowerCase();
+  if (t === "major") {
+    major += 1;
+    minor = 0;
+    patch = 0;
+  } else if (t === "minor") {
+    minor += 1;
+    patch = 0;
+    if (minor > 99) {
+      major += 1;
+      minor = 0;
+    }
+  } else {
+    patch += 1;
+    if (patch > 99) {
+      patch = 0;
+      minor += 1;
+      if (minor > 99) {
+        major += 1;
+        minor = 0;
+      }
+    }
+  }
+  return composeOwnerVersionCode(major, minor, patch);
+}
+
+function inferOwnerVersionBumpType(input) {
+  const text = String(input || "").toLowerCase();
+  if (!text) return "patch";
+  if (/(^|\s)(major|breaking|release|rewrite|umbau|neuaufbau)(\s|$)/.test(text)) return "major";
+  if (/(^|\s)(minor|feature|feat|funktion|neu)(\s|$)/.test(text)) return "minor";
+  if (/(^|\s)(patch|fix|hotfix|bug|fehler)(\s|$)/.test(text)) return "patch";
+  return "patch";
+}
+
+function writeOwnerLocalProperty(key, value) {
+  const line = `${key}=${value}`;
+  let txt = "";
+  if (fs.existsSync(OWNER_LOCAL_PROPERTIES)) {
+    txt = fs.readFileSync(OWNER_LOCAL_PROPERTIES, "utf8");
+  }
+  const hasKey = new RegExp(`^${key}=`, "m").test(txt);
+  if (hasKey) {
+    txt = txt.replace(new RegExp(`^${key}=.*$`, "m"), line);
+  } else {
+    const suffix = txt.endsWith("\n") || txt.length === 0 ? "" : "\n";
+    txt = `${txt}${suffix}${line}\n`;
+  }
+  fs.writeFileSync(OWNER_LOCAL_PROPERTIES, txt, "utf8");
+}
+
+function bumpOwnerLocalVersionForBuild(hintText = "") {
+  const current = readOwnerLocalProperties();
+  const fromCode = Number(current.versionCode || 0) || 0;
+  const baseCode = fromCode > 0 ? fromCode : 1;
+  const bumpType = inferOwnerVersionBumpType(hintText);
+  const nextCode = bumpOwnerVersionCode(baseCode, bumpType);
+  writeOwnerLocalProperty("OWNER_APK_VERSION_CODE", String(nextCode));
+  return {
+    bumpType,
+    prevCode: baseCode,
+    nextCode,
+    prevVersion: formatOwnerVersion(baseCode),
+    nextVersion: formatOwnerVersion(nextCode),
+  };
+}
+
+function readOwnerAppUrlState() {
+  try {
+    if (!fs.existsSync(OWNER_APP_URL_STATE_FILE))
+      return {
+        lastUrl: "",
+        lastVersionCode: 0,
+        builtAt: null,
+        lastSendOk: false,
+        pendingSend: false,
+        lastAttemptAt: null,
+        lastError: null,
+      };
+    const raw = fs.readFileSync(OWNER_APP_URL_STATE_FILE, "utf8");
+    const data = JSON.parse(raw);
+    return {
+      lastUrl: String(data?.lastUrl || ""),
+      lastVersionCode: Number(data?.lastVersionCode || 0) || 0,
+      builtAt: data?.builtAt || null,
+      lastSendOk: Boolean(data?.lastSendOk),
+      pendingSend: Boolean(data?.pendingSend),
+      lastAttemptAt: data?.lastAttemptAt || null,
+      lastError: data?.lastError ? String(data.lastError) : null,
+    };
+  } catch {
+    return {
+      lastUrl: "",
+      lastVersionCode: 0,
+      builtAt: null,
+      lastSendOk: false,
+      pendingSend: false,
+      lastAttemptAt: null,
+      lastError: null,
+    };
+  }
+}
+
+function writeOwnerAppUrlState({ url, versionCode, sendOk }) {
+  const prev = readOwnerAppUrlState();
+  const payload = {
+    lastUrl: url || "",
+    lastVersionCode: Number(versionCode || 0) || 0,
+    builtAt: new Date().toISOString(),
+    lastSendOk: Boolean(sendOk),
+    pendingSend: sendOk ? false : true,
+    lastAttemptAt: new Date().toISOString(),
+    lastError: sendOk ? null : prev.lastError || null,
+  };
+  fs.writeFileSync(OWNER_APP_URL_STATE_FILE, JSON.stringify(payload, null, 2), "utf8");
+}
+
+function updateOwnerAppUrlStatePartial(partial) {
+  const prev = readOwnerAppUrlState();
+  const payload = {
+    lastUrl: prev.lastUrl || "",
+    lastVersionCode: Number(prev.lastVersionCode || 0) || 0,
+    builtAt: prev.builtAt || null,
+    lastSendOk: Boolean(prev.lastSendOk),
+    pendingSend: Boolean(prev.pendingSend),
+    lastAttemptAt: prev.lastAttemptAt || null,
+    lastError: prev.lastError || null,
+    ...partial,
+  };
+  fs.writeFileSync(OWNER_APP_URL_STATE_FILE, JSON.stringify(payload, null, 2), "utf8");
+}
+
+async function sendLatestOwnerApkToOwners(sock, reason = "send") {
+  const lp = readOwnerLocalProperties();
+  if (!fs.existsSync(OWNER_APK_PATH)) {
+    throw new Error("APK nicht gefunden.");
+  }
+  const apk = fs.readFileSync(OWNER_APK_PATH);
+  const infoLines = [
+    `APP_URL: ${lp.appUrl || "-"}`,
+    `VersionCode: ${lp.versionCode || "-"}`,
+    `Datei: ${path.basename(OWNER_APK_PATH)}`,
+    `Groesse: ${formatBytes(apk.length)}`,
+    `Grund: ${reason}`,
+  ];
+  let sentOk = true;
+  let lastErr = null;
+  for (const ownerId of OWNER_IDS) {
+    try {
+      await sock.sendMessage(ownerId, {
+        document: apk,
+        fileName: `owner-app-${new Date().toISOString().replace(/[:.]/g, "-")}.apk`,
+        mimetype: "application/vnd.android.package-archive",
+        caption: formatMessage("Owner APK Auto-Build", infoLines, "", "📦", {
+          user: "Owner",
+          command: "auto-build",
+        }),
+      });
+    } catch (sendErr) {
+      sentOk = false;
+      lastErr = formatError(sendErr).slice(0, 240);
+      const fallbackLines = [
+        "APK konnte nicht direkt gesendet werden.",
+        `Fehler: ${lastErr}`,
+        lp.apkDownloadUrl ? `Download: ${lp.apkDownloadUrl}` : "Download-Link nicht gesetzt.",
+      ];
+      try {
+        await sendPlain(sock, ownerId, "Owner APK Auto-Build Fallback", fallbackLines, "", "⚠️");
+      } catch {
+        // ignore
+      }
+    }
+  }
+  updateOwnerAppUrlStatePartial({
+    lastSendOk: sentOk,
+    pendingSend: !sentOk,
+    lastAttemptAt: new Date().toISOString(),
+    lastError: sentOk ? null : lastErr,
+  });
+  return sentOk;
+}
+
+async function buildOwnerApkAndSend(sock, url, reason = "watcher") {
+  if (ownerApkBuildRunning) return;
+  ownerApkBuildRunning = true;
+  try {
+    const lp = readOwnerLocalProperties();
+    const resolvedUrl = url || lp.appUrl;
+    const versionCode = lp.versionCode || 0;
+    log("cmd", `Owner-APK Auto-Build gestartet (${reason}) fuer URL: ${resolvedUrl}`);
+    log("cmd", `APK Build ${renderProgressBar(0)} Start`);
+    const { stdout, stderr } = await runGradleBuildWithProgress();
+    if (!fs.existsSync(OWNER_APK_PATH)) {
+      throw new Error("APK nicht gefunden nach Build.");
+    }
+    const sentOk = await sendLatestOwnerApkToOwners(sock, `${reason}/post-build`);
+    writeOwnerAppUrlState({ url: resolvedUrl, versionCode, sendOk: sentOk });
+    if (stderr?.trim()) {
+      log("close", `Gradle stderr (gekürzt): ${stderr.trim().slice(0, 180)}`);
+    }
+    if (stdout?.trim()) {
+      log("open", "Owner-APK Build abgeschlossen.");
+    }
+  } catch (err) {
+    const lp = readOwnerLocalProperties();
+    writeOwnerAppUrlState({ url: url || lp.appUrl, versionCode: lp.versionCode, sendOk: false });
+    await recordError("owner_apk_autobuild", err, "autobuild", "owner-app");
+    const text = formatError(err).slice(0, 900);
+    for (const ownerId of OWNER_IDS) {
+      try {
+        await sendPlain(sock, ownerId, "Owner APK Auto-Build fehlgeschlagen", [text], "", "❌");
+      } catch {
+        // ignore
+      }
+    }
+  } finally {
+    ownerApkBuildRunning = false;
+  }
+}
+
+function startOwnerApkUrlWatcher(sock) {
+  if (ownerApkWatcherTimer) return;
+  ownerApkWatcherTimer = setInterval(() => {
+    const lp = readOwnerLocalProperties();
+    const currentUrl = lp.appUrl;
+    const currentVersionCode = lp.versionCode || 0;
+    if (!currentUrl) return;
+    const state = readOwnerAppUrlState();
+    const urlChanged = state.lastUrl !== currentUrl;
+    const versionChanged = Number(state.lastVersionCode || 0) !== currentVersionCode;
+    const lastAttemptTs = state.lastAttemptAt ? new Date(state.lastAttemptAt).getTime() : 0;
+    const retryDue = !state.lastSendOk && Date.now() - lastAttemptTs > 60 * 1000;
+    if (!urlChanged && !versionChanged && !retryDue) return;
+    buildOwnerApkAndSend(sock, currentUrl, urlChanged || versionChanged ? "url-change" : "retry").catch(() => {});
+  }, 15000);
+}
+
+async function flushPendingOwnerApkSend(sock) {
+  const st = readOwnerAppUrlState();
+  if (!st.pendingSend) return;
+  try {
+    log("cmd", "Owner-APK Pending-Send wird nach Verbindung versucht.");
+    await sendLatestOwnerApkToOwners(sock, "reconnect-pending");
+  } catch (err) {
+    updateOwnerAppUrlStatePartial({
+      lastSendOk: false,
+      pendingSend: true,
+      lastAttemptAt: new Date().toISOString(),
+      lastError: formatError(err).slice(0, 240),
+    });
+  }
+}
+
+function renderProgressBar(percent, width = 20) {
+  const p = Math.max(0, Math.min(100, percent));
+  const filled = Math.round((p / 100) * width);
+  return `[${"█".repeat(filled)}${"░".repeat(Math.max(0, width - filled))}] ${p}%`;
+}
+
+async function runGradleBuildWithProgress() {
+  return new Promise((resolve, reject) => {
+    const child = spawn("./gradlew", ["assembleDebug"], {
+      cwd: OWNER_ANDROID_DIR,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let lastPercent = 0;
+    let out = "";
+    let err = "";
+    const bump = (pct, label) => {
+      if (pct <= lastPercent) return;
+      lastPercent = pct;
+      log("cmd", `APK Build ${renderProgressBar(pct)} ${label}`);
+    };
+
+    child.stdout.on("data", (buf) => {
+      const text = String(buf || "");
+      out += text;
+      if (/CONFIGURING/.test(text)) bump(10, "Konfiguration");
+      if (/Task .*:compile/i.test(text)) bump(35, "Compile");
+      if (/Task .*:merge/i.test(text)) bump(55, "Merge");
+      if (/Task .*:packageDebug/i.test(text)) bump(80, "Packaging");
+      if (/BUILD SUCCESSFUL/i.test(text)) bump(100, "Fertig");
+    });
+
+    child.stderr.on("data", (buf) => {
+      const text = String(buf || "");
+      err += text;
+      if (/deprecated/i.test(text)) bump(65, "Warnungen");
+    });
+
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) return resolve({ stdout: out, stderr: err });
+      reject(new Error(`Gradle failed (code=${code})\n${(err || out).slice(-1200)}`));
+    });
+  });
+}
+
+function hashOwnerPassword(password, salt = null) {
+  const usedSalt = salt || crypto.randomBytes(16).toString("hex");
+  const hash = crypto.pbkdf2Sync(password, usedSalt, 120000, 32, "sha256").toString("hex");
+  return { hash, salt: usedSalt };
 }
 
 function inferSeverity(source, err) {
@@ -242,26 +842,66 @@ async function recordError(source, err, command = null, chatId = null) {
   return errorId;
 }
 
-function formatMessage(title, lines = [], footer = "", emoji = "ℹ️") {
-  let out = `${emoji} ${title}`;
+function toSingleLine(text) {
+  return String(text || "").replace(/\s+/g, " ").trim();
+}
+
+function buildMessageMeta(m, fallbackCommand = "system", fallbackUser = "Nutzer") {
+  const user = toSingleLine(m?.pushName) || toSingleLine(m?.key?.participant) || fallbackUser;
+  const raw = getText(m?.message);
+  const command = toSingleLine(raw.split("\n")[0]) || fallbackCommand;
+  return { user, command };
+}
+
+function formatMessage(title, lines = [], footer = "", emoji = "ℹ️", meta = null) {
+  const user = meta?.user || "Nutzer";
+  const command = meta?.command || "system";
+  const innerWidth = 29;
+  const border = `+${"-".repeat(innerWidth + 2)}+`;
+  const divider = "_".repeat(innerWidth + 4);
+  const fit = (value, max = innerWidth) => {
+    const text = String(value || "");
+    if (text.length <= max) return text;
+    if (max <= 3) return text.slice(0, max);
+    return `${text.slice(0, max - 3)}...`;
+  };
+  const line = (value, align = "left") => {
+    const text = fit(value, innerWidth);
+    if (align === "center") {
+      const left = Math.max(0, Math.floor((innerWidth - text.length) / 2));
+      const right = Math.max(0, innerWidth - text.length - left);
+      return `| ${" ".repeat(left)}${text}${" ".repeat(right)} |`;
+    }
+    return `| ${text.padEnd(innerWidth, " ")} |`;
+  };
+  let out = "";
+  out += `${border}\n`;
+  out += `${line("CIPHERPHANTOM", "center")}\n`;
+  out += `${border}\n`;
+  out += `Hallo ${user}\n`;
+  out += `Befehl: ${command}\n`;
+  out += `${divider}\n`;
+  out += `${emoji} ${title}`;
   if (lines.length) {
-    out += "\n" + lines.map((l) => `• ${l}`).join("\n");
+    out += "\n" + lines.map((l) => `- ${l}`).join("\n");
   }
-  if (footer) out += `\n${footer}`;
-  return out;
+  if (footer) out += `\n${divider}\n${footer}`;
+  return `\`\`\`\n${out}\n\`\`\``;
 }
 
 async function sendText(sock, chatId, m, title, lines, footer, emoji) {
+  const meta = buildMessageMeta(m, "system");
   return sock.sendMessage(
     chatId,
-    { text: formatMessage(title, lines, footer, emoji) },
+    { text: formatMessage(title, lines, footer, emoji, meta) },
     { quoted: m },
   );
 }
 
 async function sendPlain(sock, chatId, title, lines, footer, emoji) {
+  const meta = { user: "Nutzer", command: "system" };
   return sock.sendMessage(chatId, {
-    text: formatMessage(title, lines, footer, emoji),
+    text: formatMessage(title, lines, footer, emoji, meta),
   });
 }
 
@@ -270,9 +910,96 @@ async function syncDb(db) {
   await db.exec("PRAGMA wal_checkpoint(PASSIVE)");
 }
 
+async function resolveOutboxTargets(db, job) {
+  if (job.type === "single") {
+    return job.target_id ? [job.target_id] : [];
+  }
+  if (job.type !== "broadcast") return [];
+
+  if (job.target_scope === "users") {
+    const users = await listUsers(db);
+    return users.map((u) => u.chat_id).filter(Boolean);
+  }
+  if (job.target_scope === "groups") {
+    const chats = await listKnownChats(db, true);
+    return chats.map((c) => c.chat_id).filter(Boolean);
+  }
+  if (job.target_scope === "all") {
+    const users = await listUsers(db);
+    const groups = await listKnownChats(db, true);
+    return [...new Set([...users.map((u) => u.chat_id), ...groups.map((g) => g.chat_id)].filter(Boolean))];
+  }
+  return [];
+}
+
+async function resolveBroadcastTargets(db, scope) {
+  const mode = String(scope || "users").toLowerCase();
+  if (mode === "users") {
+    const users = await listUsers(db);
+    return users.map((u) => u.chat_id).filter(Boolean);
+  }
+  if (mode === "groups") {
+    const groups = await listKnownChats(db, true);
+    return groups.map((g) => g.chat_id).filter(Boolean);
+  }
+  if (mode === "all") {
+    const users = await listUsers(db);
+    const groups = await listKnownChats(db, true);
+    return [...new Set([...users.map((u) => u.chat_id), ...groups.map((g) => g.chat_id)].filter(Boolean))];
+  }
+  return [];
+}
+
+function buildOwnerOutboxText(job) {
+  const msg = String(job.message || "").trim();
+  const signature = String(job.signature || "").trim();
+  if (!signature) return msg;
+  return `${msg}\n\n${signature}`;
+}
+
+async function processOwnerOutbox(db, sock) {
+  if (!db || !sock || ownerOutboxBusy) return;
+  ownerOutboxBusy = true;
+  try {
+    const jobs = await listPendingOwnerOutbox(db, 15);
+    for (const job of jobs) {
+      try {
+        const targets = await resolveOutboxTargets(db, job);
+        if (!targets.length) {
+          await markOwnerOutboxFailed(db, job.id, "Keine Ziel-Chats gefunden.");
+          continue;
+        }
+        const text = buildOwnerOutboxText(job);
+        let success = 0;
+        let fails = 0;
+        for (const chatId of targets) {
+          try {
+            await sock.sendMessage(chatId, { text });
+            success += 1;
+            await wait(180);
+          } catch {
+            fails += 1;
+          }
+        }
+        if (success > 0) {
+          await markOwnerOutboxSent(db, job.id);
+        } else {
+          await markOwnerOutboxFailed(db, job.id, `Versand fehlgeschlagen (${fails}/${targets.length})`);
+        }
+      } catch (err) {
+        await markOwnerOutboxFailed(db, job.id, formatError(err).slice(0, 500));
+      }
+    }
+  } catch (err) {
+    await recordError("owner_outbox_worker", err).catch(() => {});
+  } finally {
+    ownerOutboxBusy = false;
+  }
+}
+
 async function runStartupSelftest(db) {
   const issues = [];
-  const requiredDirs = [DATA_DIR, INBOX_DIR, ERROR_EXPORT_DIR];
+  const requiredDirs = [DATA_DIR, INBOX_DIR, ERROR_EXPORT_DIR, AVATAR_DIR];
   for (const dir of requiredDirs) {
     try {
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -308,6 +1035,7 @@ async function runStartupSelftest(db) {
 
 const OWNER_AUDIT_COMMANDS = new Set([
   "chatid",
+  "ownerpass",
   "syncroles",
   "dbdump",
   "ban",
@@ -321,6 +1049,15 @@ const OWNER_AUDIT_COMMANDS = new Set([
   "errorfile",
   "sendpc",
   "pcupload",
+  "sendmsg",
+  "broadcast",
+  "outbox",
+  "apppanel",
+  "appstart",
+  "appstop",
+  "apprestart",
+  "applogs",
+  "saveavatar",
   "health",
   "fix",
   "audits",
@@ -328,6 +1065,10 @@ const OWNER_AUDIT_COMMANDS = new Set([
   "helpedit",
   "helpdel",
   "helplist",
+  "biodebug",
+  "setbio",
+  "showbio",
+  "clearbio",
 ]);
 
 async function auditOwnerCommand(db, senderId, cmd, args, chatId) {
@@ -739,7 +1480,7 @@ function formatDumpSection(title, rows) {
   return `${header}\n${lines.join("\n")}\n`;
 }
 
-async function sendDbDump(sock, chatId, db) {
+async function sendDbDump(sock, chatId, db, m = null) {
   const dump = await dumpAll(db);
   const content =
     formatDumpSection("users", dump.users) +
@@ -752,11 +1493,12 @@ async function sendDbDump(sock, chatId, db) {
   const filePath = path.resolve(DATA_DIR, `dbdump-${ts}.txt`);
   fs.writeFileSync(filePath, content, "utf8");
 
+  const meta = buildMessageMeta(m, "dbdump");
   await sock.sendMessage(chatId, {
     document: fs.readFileSync(filePath),
     fileName: path.basename(filePath),
     mimetype: "text/plain",
-    caption: "DB Dump (Text)",
+    caption: formatMessage("DB Dump (Text)", ["Datei wurde erstellt und angehaengt."], "", "📄", meta),
   });
 }
 
@@ -1079,7 +1821,7 @@ function drawPdfHeader(doc, pageNumber, meta) {
     });
 }
 
-async function sendGuidePdf(sock, chatId, prefix) {
+async function sendGuidePdf(sock, chatId, prefix, m = null) {
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
   const exportDir = path.resolve(DATA_DIR, "exports");
   if (!fs.existsSync(exportDir)) fs.mkdirSync(exportDir, { recursive: true });
@@ -1162,15 +1904,16 @@ async function sendGuidePdf(sock, chatId, prefix) {
   doc.end();
   await new Promise((resolve) => stream.on("finish", resolve));
 
+  const msgMeta = buildMessageMeta(m, "guide");
   await sock.sendMessage(chatId, {
     document: fs.readFileSync(filePath),
     fileName: path.basename(filePath),
     mimetype: "application/pdf",
-    caption: "CIPHERPHANTOM Anleitung",
+    caption: formatMessage("CIPHERPHANTOM Anleitung", ["PDF mit Anleitung wurde erstellt."], "", "📘", msgMeta),
   });
 }
 
-async function sendDbDumpPdf(sock, chatId, db) {
+async function sendDbDumpPdf(sock, chatId, db, m = null) {
   const dump = await dumpAll(db);
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
   const exportDir = path.resolve(DATA_DIR, "exports");
@@ -1345,11 +2088,12 @@ async function sendDbDumpPdf(sock, chatId, db) {
 
   await new Promise((resolve) => stream.on("finish", resolve));
 
+  const msgMeta = buildMessageMeta(m, "dbdump");
   await sock.sendMessage(chatId, {
     document: fs.readFileSync(filePath),
     fileName: path.basename(filePath),
     mimetype: "application/pdf",
-    caption: "DB Dump (PDF)",
+    caption: formatMessage("DB Dump (PDF)", ["PDF-Export wurde erstellt und angehaengt."], "", "📑", msgMeta),
   });
 }
 
@@ -1445,6 +2189,7 @@ async function start() {
   if (!fs.existsSync(PREFIX_FILE)) savePrefixes({});
   if (!fs.existsSync(INBOX_DIR)) fs.mkdirSync(INBOX_DIR, { recursive: true });
   if (!fs.existsSync(ERROR_EXPORT_DIR)) fs.mkdirSync(ERROR_EXPORT_DIR, { recursive: true });
+  if (!fs.existsSync(AVATAR_DIR)) fs.mkdirSync(AVATAR_DIR, { recursive: true });
 
   printBanner();
   // Alles vor diesem Zeitpunkt gilt als Altlast und wird ignoriert
@@ -1476,6 +2221,13 @@ async function start() {
     await syncDb(db);
     return rawSendMessage(...args);
   };
+
+  if (!ownerOutboxTimer) {
+    ownerOutboxTimer = setInterval(() => {
+      processOwnerOutbox(runtimeDb, runtimeSock).catch(() => {});
+    }, 4000);
+  }
+  startOwnerApkUrlWatcher(sock);
 
   // Neue Credentials automatisch speichern
   sock.ev.on("creds.update", saveCreds);
@@ -1516,6 +2268,7 @@ async function start() {
     }
     if (connection === "open") {
       log("open", "Verbunden");
+      flushPendingOwnerApkSend(sock).catch(() => {});
       if (startupSelftestIssues.length > 0 && !startupSelftestSent) {
         startupSelftestSent = true;
         const lines = ["Selftest hat Probleme gefunden:", ...startupSelftestIssues.slice(0, 12)];
@@ -1546,6 +2299,7 @@ async function start() {
     const chatId = m.key.remoteJid;
     const senderId = m.key.participant || m.key.remoteJid;
     const body = getText(m.message);
+    await upsertKnownChat(db, chatId, chatId?.endsWith("@g.us"));
 
     // Ban-Check: auf jede Nachricht reagieren
     const ban = await getBan(db, senderId);
@@ -1588,6 +2342,8 @@ async function start() {
     // Command parsen
     const parsed = parseCommand(body, prefix);
     if (!parsed) return;
+    syncUserAvatar(db, sock, senderId).catch(() => {});
+    syncUserBiography(db, sock, chatId, [senderId, chatId]).catch(() => {});
 
     const { cmd, args } = parsed;
     log("cmd", `Befehl: ${cmd} | Chat: ${chatId}`);
@@ -1683,82 +2439,115 @@ async function start() {
           );
           break;
         }
+        const sep = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
+        const menuLines = [
+          `${sep}`,
+          "👤 PROFIL",
+          "  ├─ 🪪 Konto",
+          `  │  • ${prefix}profile  • Profilinfo`,
+          `  │  • ${prefix}xp  • Levelstand`,
+          "  └─ ✏️ Verwaltung",
+          `     • ${prefix}name <neuer_name>  • Name aendern`,
+          `     • ${prefix}delete  • Account loeschen`,
+          `${sep}`,
+          "💰 WALLET",
+          "  ├─ 🧾 Kontostand",
+          `  │  • ${prefix}wallet  • Kontostand`,
+          "  └─ 🔁 Transfer",
+          `     • ${prefix}pay <wallet_address> <betrag>  • PHN senden`,
+          `${sep}`,
+          "🎮 SPIELE",
+          "  ├─ 🍀 Quick Games",
+          `  │  • ${prefix}flip <betrag> <kopf|zahl>  • Coinflip`,
+          `  │  • ${prefix}slots <betrag>  • Slots`,
+          `  │  • ${prefix}roulette <betrag> <rot|schwarz|gerade|ungerade|zahl> [wert]  • Roulette`,
+          "  └─ 🃏 Session Games",
+          `     • ${prefix}blackjack <betrag>|hit|stand  • Blackjack`,
+          `     • ${prefix}fish <betrag>  • Fishgame`,
+          `     • ${prefix}stacker <betrag>|cashout  • Risiko-Spiel`,
+          `${sep}`,
+          "🧑 CHARAKTER",
+          "  ├─ 📊 Status",
+          `  │  • ${prefix}char  • Status`,
+          "  ├─ 🛒 Setup",
+          `  │  • ${prefix}buychar <name>  • Charakter kaufen`,
+          `  │  • ${prefix}charname <neuer_name>  • Charaktername`,
+          "  └─ 🧰 Pflege",
+          `     • ${prefix}work  • Arbeiten`,
+          `     • ${prefix}feed <snack|meal|feast>  • Fuettern`,
+          `     • ${prefix}med <small|big>  • Medizin`,
+          `${sep}`,
+          "🎯 FORTSCHRITT",
+          "  ├─ 🎁 Boni",
+          `  │  • ${prefix}daily  • Tagesbonus`,
+          `  │  • ${prefix}weekly  • Wochenbonus`,
+          "  └─ 🏁 Quests",
+          `     • ${prefix}quests <daily|weekly|monthly|progress>  • Questliste`,
+          `     • ${prefix}claim <quest_id>  • Belohnung`,
+          `${sep}`,
+          "👥 SOCIAL",
+          "  └─ 🤝 Freunde",
+          `     • ${prefix}friendcode  • Code zeigen`,
+          `     • ${prefix}addfriend <code>  • Freund adden`,
+          `     • ${prefix}friends  • Freundesliste`,
+          `${sep}`,
+          "⚙️ SYSTEM",
+          "  └─ 📚 Hilfe",
+          `     • ${prefix}guide  • Bot-Anleitung`,
+          `     • ${prefix}help <befehl>  • Detailhilfe`,
+          `     • ${prefix}helpsearch <text>  • Hilfe suchen`,
+          `     • ${prefix}prefix <neues_prefix>  • Prefix setzen`,
+          `     • ${prefix}ping  • Erreichbarkeit`,
+        ];
+        const ownerLines = isOwner(senderId)
+          ? [
+              `${sep}`,
+              "🛡️ OWNER KONSOLE",
+              "  ├─ 🛰️ Bot Core",
+              `  │  • ${prefix}chatid  • Chat-ID`,
+              `  │  • ${prefix}ownerpass <passwort>  • App-Login`,
+              `  │  • ${prefix}syncroles  • Rollen sync`,
+              `  │  • ${prefix}dbdump  • DB Export`,
+              `  │  • ${prefix}health  • Botstatus`,
+              "  ├─ 🔨 Moderation",
+              `  │  • ${prefix}ban <id|@user> [dauer] [grund]  • Ban setzen`,
+              `  │  • ${prefix}unban <id|@user>  • Ban aufheben`,
+              `  │  • ${prefix}bans  • Banliste`,
+              `  │  • ${prefix}purge <id|@user>  • Profil loeschen`,
+              "  ├─ 💸 Economy Admin",
+              `  │  • ${prefix}setphn <id|@user> <betrag>  • PHN setzen`,
+              "  ├─ 📢 Comm Center",
+              `  │  • ${prefix}sendmsg <nummer|jid> <text>  • Direktnachricht`,
+              `  │  • ${prefix}broadcast <users|groups|all> <text>  • Rundsendung`,
+              `  │  • ${prefix}outbox [status] [limit]  • Sendestatus`,
+              "  ├─ 📱 App Notfallsteuerung",
+              `  │  • ${prefix}apppanel  • App-Panel`,
+              `  │  • ${prefix}appstart  • App starten`,
+              `  │  • ${prefix}appstop  • App stoppen`,
+              `  │  • ${prefix}apprestart  • App neustarten`,
+              `  │  • ${prefix}applogs [zeilen]  • App-Logs`,
+              "  ├─ 🗂️ Owner Tools",
+              `  │  • ${prefix}todo <add|list|edit|done|del> ...  • Aufgaben`,
+              `  │  • ${prefix}sendpc <text|datei>  • Handy-Upload`,
+              "  ├─ 🧯 Debug & Fix",
+              `  │  • ${prefix}errors [limit] [severity]  • Fehlerliste`,
+              `  │  • ${prefix}error <FEHLER-ID>  • Fehlerdetails`,
+              `  │  • ${prefix}errorfile <FEHLER-ID>  • Fehlerdatei`,
+              `  │  • ${prefix}fix <add|list|status> ...  • Fix-Queue`,
+              `  │  • ${prefix}audits [limit]  • Admin-Log`,
+              "  └─ 📖 Help Admin",
+              `     • ${prefix}helpadd ...  • Help anlegen`,
+              `     • ${prefix}helpedit ...  • Help aendern`,
+              `     • ${prefix}helpdel <cmd>  • Help loeschen`,
+              `     • ${prefix}helplist [all|owner|public]  • Helpliste`,
+            ]
+          : [];
         await sendText(
           sock,
           chatId,
           m,
           `Befehle (Prefix: ${prefix})`,
-          [
-            "┏━ 👤 Profil",
-            `${prefix}profile  • Profilinfo`,
-            `${prefix}xp  • Levelstand`,
-            `${prefix}name <neuer_name>  • Name aendern`,
-            `${prefix}delete  • Account loeschen`,
-            "",
-            "┏━ 💰 Wallet",
-            `${prefix}wallet  • Kontostand`,
-            `${prefix}pay <wallet_address> <betrag>  • PHN senden`,
-            "",
-            "┏━ 🎮 Spiele",
-            `${prefix}flip <betrag> <kopf|zahl>  • Coinflip`,
-            `${prefix}slots <betrag>  • Slots`,
-            `${prefix}roulette <betrag> <rot|schwarz|gerade|ungerade|zahl> [wert]  • Roulette`,
-            `${prefix}blackjack <betrag>|hit|stand  • Blackjack`,
-            `${prefix}fish <betrag>  • Fishgame`,
-            `${prefix}stacker <betrag>|cashout  • Risiko-Spiel`,
-            "",
-            "┏━ 🧑 Charakter",
-            `${prefix}char  • Status`,
-            `${prefix}buychar <name>  • Charakter kaufen`,
-            `${prefix}charname <neuer_name>  • Charaktername`,
-            `${prefix}work  • Arbeiten`,
-            `${prefix}feed <snack|meal|feast>  • Fuettern`,
-            `${prefix}med <small|big>  • Medizin`,
-            "",
-            "┏━ 🎯 Fortschritt",
-            `${prefix}daily  • Tagesbonus`,
-            `${prefix}weekly  • Wochenbonus`,
-            `${prefix}quests <daily|weekly|monthly|progress>  • Questliste`,
-            `${prefix}claim <quest_id>  • Belohnung`,
-            "",
-            "┏━ 👥 Social",
-            `${prefix}friendcode  • Code zeigen`,
-            `${prefix}addfriend <code>  • Freund adden`,
-            `${prefix}friends  • Freundesliste`,
-            "",
-            "┏━ ⚙️ System",
-            `${prefix}guide  • Bot-Anleitung`,
-            `${prefix}help <befehl>  • Detailhilfe`,
-            `${prefix}helpsearch <text>  • Hilfe suchen`,
-            `${prefix}prefix <neues_prefix>  • Prefix setzen`,
-            `${prefix}ping  • Erreichbarkeit`,
-            ...(isOwner(senderId)
-              ? [
-                  "",
-                  "┏━ 🛡️ Owner",
-                  `${prefix}chatid  • Chat-ID`,
-                  `${prefix}syncroles  • Rollen sync`,
-                  `${prefix}dbdump  • DB Export`,
-                  `${prefix}ban <id|@user> [dauer] [grund]  • Nutzer sperren`,
-                  `${prefix}unban <id|@user>  • Sperre aufheben`,
-                  `${prefix}bans  • Sperrliste`,
-                  `${prefix}setphn <id|@user> <betrag>  • PHN setzen`,
-                  `${prefix}purge <id|@user>  • Profil entfernen`,
-                  `${prefix}todo <add|list|edit|done|del> ...  • Aufgaben`,
-                  `${prefix}errors [limit] [severity]  • Fehlerliste`,
-                  `${prefix}error <FEHLER-ID>  • Fehlerdetails`,
-                  `${prefix}errorfile <FEHLER-ID>  • Fehlerdatei`,
-                  `${prefix}fix <add|list|status> ...  • Fix-Queue`,
-                  `${prefix}audits [limit]  • Admin-Log`,
-                  `${prefix}health  • Botstatus`,
-                  `${prefix}sendpc <text|datei>  • Handy-Upload`,
-                  `${prefix}helpadd ...  • Help anlegen`,
-                  `${prefix}helpedit ...  • Help aendern`,
-                  `${prefix}helpdel <cmd>  • Help loeschen`,
-                  `${prefix}helplist [all|owner|public]  • Helpliste`,
-                ]
-              : []),
-          ],
+          [...menuLines, ...ownerLines, sep],
           "",
           "📌",
         );
@@ -2801,7 +3590,7 @@ async function start() {
           await getUser(db, chatId),
         );
         if (!user) break;
-        await sendGuidePdf(sock, chatId, prefix);
+        await sendGuidePdf(sock, chatId, prefix, m);
         break;
       }
 
@@ -4374,6 +5163,39 @@ async function start() {
         break;
       }
 
+      case "ownerpass": {
+        // Owner: Passwort fuer Owner-App setzen
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        const newPass = args.join(" ").trim();
+        if (!newPass || newPass.length < 8) {
+          await sendText(
+            sock,
+            chatId,
+            m,
+            "Usage",
+            [`${prefix}ownerpass <neues_passwort>`, "Mindestens 8 Zeichen."],
+            "",
+            "🔐",
+          );
+          break;
+        }
+        const { hash, salt } = hashOwnerPassword(newPass);
+        await upsertOwnerPasswordHash(db, senderId, hash, salt);
+        await sendText(
+          sock,
+          chatId,
+          m,
+          "Owner Passwort gespeichert",
+          ["Login fuer Owner-App ist jetzt aktiv."],
+          "",
+          "✅",
+        );
+        break;
+      }
+
       case "ban": {
         // Owner: Nutzer bannen
         if (!isOwner(senderId)) {
@@ -4859,7 +5681,13 @@ async function start() {
             document: fs.readFileSync(filePath),
             fileName,
             mimetype: "text/plain",
-            caption: `Fehlerexport ${row.error_id}`,
+            caption: formatMessage(
+              "Fehlerexport",
+              [`Datei: ${row.error_id}.txt wurde erstellt.`],
+              "",
+              "🧾",
+              buildMessageMeta(m, "errorfile"),
+            ),
           },
           { quoted: m },
         );
@@ -4990,6 +5818,413 @@ async function start() {
         break;
       }
 
+      case "sendmsg": {
+        // Owner: Direktnachricht an Nummer/JID senden (mit Signatur)
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        const targetRaw = (args[0] || "").trim();
+        const messageText = args.slice(1).join(" ").trim();
+        const targetJid = normalizeTargetToJid(targetRaw);
+        if (!targetJid || !messageText) {
+          await sendText(
+            sock,
+            chatId,
+            m,
+            "Usage",
+            [`${prefix}sendmsg <nummer|jid> <nachricht>`],
+            "",
+            "ℹ️",
+          );
+          break;
+        }
+        const ownerUser = await getUser(db, chatId);
+        const signature = `— ${ownerUser?.profile_name || toSingleLine(m?.pushName) || "Owner"}`;
+        const finalText = `${messageText}\n\n${signature}`;
+        try {
+          await sock.sendMessage(targetJid, { text: finalText });
+          await sendText(
+            sock,
+            chatId,
+            m,
+            "Nachricht gesendet",
+            [`Empfaenger: ${targetJid}`, "Signatur angehaengt."],
+            "",
+            "✅",
+          );
+        } catch (err) {
+          await sendText(
+            sock,
+            chatId,
+            m,
+            "Senden fehlgeschlagen",
+            [`Empfaenger: ${targetJid}`, formatError(err).slice(0, 180)],
+            "",
+            "❌",
+          );
+        }
+        break;
+      }
+
+      case "broadcast": {
+        // Owner: Broadcast an users/groups/all senden (mit Signatur)
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        const scope = (args[0] || "").toLowerCase();
+        const text = args.slice(1).join(" ").trim();
+        if (!["users", "groups", "all"].includes(scope) || !text) {
+          await sendText(
+            sock,
+            chatId,
+            m,
+            "Usage",
+            [`${prefix}broadcast <users|groups|all> <nachricht>`],
+            "",
+            "ℹ️",
+          );
+          break;
+        }
+        const targets = await resolveBroadcastTargets(db, scope);
+        if (!targets.length) {
+          await sendText(
+            sock,
+            chatId,
+            m,
+            "Keine Ziele gefunden",
+            [`Scope: ${scope}`, "Es wurden keine passenden Chats gefunden."],
+            "",
+            "⚠️",
+          );
+          break;
+        }
+        const ownerUser = await getUser(db, chatId);
+        const signature = `— ${ownerUser?.profile_name || toSingleLine(m?.pushName) || "Owner"}`;
+        const finalText = `${text}\n\n${signature}`;
+        let success = 0;
+        let failed = 0;
+        for (const target of targets) {
+          try {
+            await sock.sendMessage(target, { text: finalText });
+            success += 1;
+            await wait(150);
+          } catch {
+            failed += 1;
+          }
+        }
+        await sendText(
+          sock,
+          chatId,
+          m,
+          "Broadcast abgeschlossen",
+          [`Scope: ${scope}`, `Gesendet: ${success}`, `Fehlgeschlagen: ${failed}`],
+          "",
+          success > 0 ? "📣" : "⚠️",
+        );
+        break;
+      }
+
+      case "outbox": {
+        // Owner: Outbox-Status (pending/sent/failed/all)
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        const statusRaw = (args[0] || "all").toLowerCase();
+        const status = ["all", "pending", "sent", "failed"].includes(statusRaw) ? statusRaw : "all";
+        const reqLimit = Number(args[1]);
+        const limit = Number.isFinite(reqLimit) && reqLimit > 0 ? Math.min(50, Math.floor(reqLimit)) : 20;
+        const rows = await listOwnerOutbox(db, status, limit);
+        if (!rows.length) {
+          await sendText(sock, chatId, m, "Outbox", [`Keine Eintraege (${status}).`], "", "ℹ️");
+          break;
+        }
+        const lines = rows.map((r) => {
+          const target = r.target_id || r.target_scope || "-";
+          return `#${r.id} | ${r.status} | ${r.type} | ${target} | ${formatDateTime(r.created_at)}${r.error ? `\n${r.error}` : ""}`;
+        });
+        await sendText(sock, chatId, m, `Outbox (${rows.length})`, lines, "", "📬");
+        break;
+      }
+
+      case "apppanel": {
+        // Owner: App-Notfallpanel via WhatsApp
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        const proc = await getPm2Proc("cipherphantom-owner-remote");
+        const status = proc?.pm2_env?.status || "unknown";
+        await sendText(
+          sock,
+          chatId,
+          m,
+          "App Notfallpanel",
+          [
+            `Status: ${status}`,
+            `▶️ Start: ${prefix}appstart`,
+            `⏹️ Stop: ${prefix}appstop`,
+            `🔄 Restart: ${prefix}apprestart`,
+            `🧾 Logs: ${prefix}applogs [zeilen]`,
+          ],
+          "",
+          "📱",
+        );
+        break;
+      }
+
+      case "appstart":
+      case "appstop":
+      case "apprestart": {
+        // Owner: Owner-App PM2 steuern
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        const action = cmd === "appstart" ? "start" : cmd === "appstop" ? "stop" : "restart";
+        const res = await runPm2([action, "cipherphantom-owner-remote"]);
+        if (!res.ok) {
+          await sendText(sock, chatId, m, "PM2 Fehler", [res.stderr.slice(0, 200)], "", "❌");
+          break;
+        }
+        const proc = await getPm2Proc("cipherphantom-owner-remote");
+        await sendText(
+          sock,
+          chatId,
+          m,
+          "App Prozess",
+          [`Aktion: ${action}`, `Status: ${proc?.pm2_env?.status || "unknown"}`],
+          "",
+          "✅",
+        );
+        break;
+      }
+
+      case "applogs": {
+        // Owner: letzte App-Logs anzeigen
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        const reqLines = Number(args[0]);
+        const lines = Number.isFinite(reqLines) && reqLines > 0 ? Math.min(120, Math.floor(reqLines)) : 40;
+        const home = process.env.HOME || "";
+        const outPath = path.join(home, ".pm2", "logs", "cipherphantom-owner-remote-out.log");
+        const errPath = path.join(home, ".pm2", "logs", "cipherphantom-owner-remote-error.log");
+        const outTail = tailFileSafe(outPath, lines);
+        const errTail = tailFileSafe(errPath, lines);
+        const text = `--- OUT ---\n${outTail || "<leer>"}\n\n--- ERR ---\n${errTail || "<leer>"}`;
+        const fileName = `applogs-${new Date().toISOString().replace(/[:.]/g, "-")}.txt`;
+        const filePath = path.join(ERROR_EXPORT_DIR, fileName);
+        fs.writeFileSync(filePath, text, "utf8");
+        await sock.sendMessage(
+          chatId,
+          {
+            document: fs.readFileSync(filePath),
+            fileName,
+            mimetype: "text/plain",
+            caption: formatMessage(
+              "App Logs",
+              [`Datei mit den letzten ${lines} Zeilen.`],
+              "",
+              "🧾",
+              buildMessageMeta(m, "applogs"),
+            ),
+          },
+          { quoted: m },
+        );
+        break;
+      }
+
+      case "biodebug": {
+        // Owner: Bio-Fetch debuggen und ggf. direkt speichern
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        const targetRaw = (args[0] || "").trim();
+        const targetJid = targetRaw ? normalizeTargetToJid(targetRaw) : senderId;
+        if (!targetJid || !targetJid.includes("@")) {
+          await sendText(sock, chatId, m, "Usage", [`${prefix}biodebug [nummer|jid]`], "", "ℹ️");
+          break;
+        }
+        try {
+          const lines = await debugUserBiographyFetch(db, sock, targetJid, [senderId, chatId]);
+          await sendText(sock, chatId, m, "Bio Debug", lines.slice(0, 24), "", "🧪");
+        } catch (err) {
+          await sendText(sock, chatId, m, "Bio Debug", [formatError(err).slice(0, 220)], "", "❌");
+        }
+        break;
+      }
+
+      case "setbio": {
+        // Owner: manuelle Bio setzen (Fallback, falls WhatsApp-Status nicht abrufbar ist)
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        const text = args.join(" ").trim();
+        if (!text) {
+          await sendText(sock, chatId, m, "Usage", [`${prefix}setbio <text>`], "", "ℹ️");
+          break;
+        }
+        await setUserBiography(db, chatId, text);
+        await sendText(sock, chatId, m, "Bio gesetzt", [text], "", "✅");
+        break;
+      }
+
+      case "showbio": {
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        const me = await getUser(db, chatId);
+        const bio = String(me?.profile_bio || "").trim();
+        await sendText(sock, chatId, m, "Aktuelle Bio", [bio || "Keine Bio gesetzt."], "", "ℹ️");
+        break;
+      }
+
+      case "clearbio": {
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        await setUserBiography(db, chatId, "");
+        await sendText(sock, chatId, m, "Bio gelöscht", ["Deine gespeicherte Bio wurde entfernt."], "", "🧹");
+        break;
+      }
+
+      case "saveavatar": {
+        // Owner: WhatsApp-Profilbild lokal speichern und Pfad in users.profile_photo_url setzen
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        const targetRaw = (args[0] || "").trim();
+        const targetJid = targetRaw ? normalizeTargetToJid(targetRaw) : senderId;
+        if (!targetJid) {
+          await sendText(sock, chatId, m, "Usage", [`${prefix}saveavatar [nummer|jid]`], "", "ℹ️");
+          break;
+        }
+        try {
+          const result = await saveAvatarForChat(db, sock, targetJid);
+          await sendText(
+            sock,
+            chatId,
+            m,
+            "Avatar gespeichert",
+            [
+              `User: ${targetJid}`,
+              `Pfad: ${result.publicPath}`,
+              `Datei: ${path.basename(result.filePath)}`,
+              `Größe: ${formatBytes(result.size)}`,
+            ],
+            "",
+            "🖼️",
+          );
+        } catch (err) {
+          await sendText(sock, chatId, m, "Avatar Fehler", [formatError(err).slice(0, 220)], "", "❌");
+        }
+        break;
+      }
+
+      case "apkstatus": {
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        const lp = readOwnerLocalProperties();
+        const st = readOwnerAppUrlState();
+        const exists = fs.existsSync(OWNER_APK_PATH);
+        const size = exists ? formatBytes(fs.statSync(OWNER_APK_PATH).size) : "-";
+        await sendText(
+          sock,
+          chatId,
+          m,
+          "APK Status",
+          [
+            `URL: ${lp.appUrl || "-"}`,
+            `Version: ${formatOwnerVersion(lp.versionCode || 0)}`,
+            `VersionCode: ${lp.versionCode || "-"}`,
+            `Download: ${lp.apkDownloadUrl || "-"}`,
+            `APK Datei: ${exists ? "vorhanden" : "fehlt"}`,
+            `Groesse: ${size}`,
+            `Letzter Build-URL: ${st.lastUrl || "-"}`,
+            `Letzter Build-VersionCode: ${st.lastVersionCode || "-"}`,
+            `Letzter Versand OK: ${st.lastSendOk ? "ja" : "nein"}`,
+            `Letzter Versuch: ${st.lastAttemptAt ? formatDateTime(st.lastAttemptAt) : "-"}`,
+          ],
+          "",
+          "📦",
+        );
+        break;
+      }
+
+      case "apkbuild": {
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        if (ownerApkBuildRunning) {
+          await sendText(sock, chatId, m, "APK Build", ["Build läuft bereits."], "", "⏳");
+          break;
+        }
+        const hintText = args.join(" ");
+        const bump = bumpOwnerLocalVersionForBuild(hintText);
+        const lp = readOwnerLocalProperties();
+        await sendText(
+          sock,
+          chatId,
+          m,
+          "APK Build",
+          [
+            "Start wurde ausgelöst.",
+            `Update-Typ: ${bump.bumpType}`,
+            `Version: ${bump.prevVersion} -> ${bump.nextVersion}`,
+            `VersionCode: ${bump.prevCode} -> ${bump.nextCode}`,
+          ],
+          "",
+          "🚀",
+        );
+        buildOwnerApkAndSend(sock, lp.appUrl, "manual-cmd").catch(() => {});
+        break;
+      }
+
+      case "apksend": {
+        if (!isOwner(senderId)) {
+          await sendText(sock, chatId, m, "Kein Zugriff", ["Owner only."], "", "🚫");
+          break;
+        }
+        if (!fs.existsSync(OWNER_APK_PATH)) {
+          await sendText(sock, chatId, m, "APK senden", ["APK Datei fehlt. Nutze erst -apkbuild"], "", "❌");
+          break;
+        }
+        const apk = fs.readFileSync(OWNER_APK_PATH);
+        await sock.sendMessage(
+          chatId,
+          {
+            document: apk,
+            fileName: `owner-app-manual-${new Date().toISOString().replace(/[:.]/g, "-")}.apk`,
+            mimetype: "application/vnd.android.package-archive",
+            caption: formatMessage(
+              "Owner APK (manuell)",
+              [
+                `Datei: ${path.basename(OWNER_APK_PATH)}`,
+                `Groesse: ${formatBytes(apk.length)}`,
+                `Tipp: -apkstatus fuer Debug`,
+              ],
+              "",
+              "📤",
+              buildMessageMeta(m, "apksend"),
+            ),
+          },
+          { quoted: m },
+        );
+        break;
+      }
+
       case "sendpc":
       case "pcupload": {
         // Owner: Text/Datei vom Handy auf den Laptop speichern
@@ -5102,7 +6337,7 @@ async function start() {
           await getUser(db, chatId),
         );
         if (!user) break;
-        await sendDbDumpPdf(sock, chatId, db);
+        await sendDbDumpPdf(sock, chatId, db, m);
         break;
       }
 

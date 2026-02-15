@@ -140,6 +140,33 @@ export async function initDb() {
       payload TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS owner_auth (
+      chat_id TEXT PRIMARY KEY,
+      password_hash TEXT NOT NULL,
+      password_salt TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS known_chats (
+      chat_id TEXT PRIMARY KEY,
+      is_group INTEGER NOT NULL DEFAULT 0,
+      last_seen_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS owner_outbox (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      type TEXT NOT NULL,
+      target_id TEXT,
+      target_scope TEXT,
+      message TEXT NOT NULL,
+      signature TEXT,
+      created_by TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      error TEXT,
+      created_at TEXT NOT NULL,
+      processed_at TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS command_help (
       cmd TEXT PRIMARY KEY,
       usage TEXT NOT NULL,
@@ -160,6 +187,7 @@ export async function initDb() {
   await db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_wallet ON users(wallet_address)");
   await db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_error_logs_error_id ON error_logs(error_id)");
   await db.exec("CREATE INDEX IF NOT EXISTS idx_error_logs_fingerprint_last_seen ON error_logs(fingerprint, last_seen_at)");
+  await db.exec("CREATE INDEX IF NOT EXISTS idx_owner_outbox_status_created ON owner_outbox(status, created_at)");
   await seedQuests(db);
   await seedCommandHelp(db);
   return db;
@@ -191,6 +219,12 @@ async function ensureUserColumns(db) {
   }
   if (!names.has("wallet_address")) {
     await db.exec("ALTER TABLE users ADD COLUMN wallet_address TEXT");
+  }
+  if (!names.has("profile_photo_url")) {
+    await db.exec("ALTER TABLE users ADD COLUMN profile_photo_url TEXT");
+  }
+  if (!names.has("profile_bio")) {
+    await db.exec("ALTER TABLE users ADD COLUMN profile_bio TEXT");
   }
 }
 
@@ -395,6 +429,15 @@ async function seedCommandHelp(db) {
     ["health", "health", "Bot-Status", "Owner only", 1],
     ["sendpc", "sendpc --name \"DATEI\" <text|datei>", "Handy-Upload", "Owner only", 1],
     ["pcupload", "pcupload --name \"DATEI\" <text|datei>", "Handy-Upload", "Alias von sendpc", 1],
+    ["sendmsg", "sendmsg <nummer|jid> <nachricht>", "Direktnachricht senden", "Owner only", 1],
+    ["broadcast", "broadcast <users|groups|all> <nachricht>", "Broadcast senden", "Owner only", 1],
+    ["outbox", "outbox [all|pending|sent|failed] [limit]", "Outboxstatus ansehen", "Owner only", 1],
+    ["apppanel", "apppanel", "App Notfallpanel", "Owner only", 1],
+    ["appstart", "appstart", "Owner-App starten", "Owner only", 1],
+    ["appstop", "appstop", "Owner-App stoppen", "Owner only", 1],
+    ["apprestart", "apprestart", "Owner-App neustarten", "Owner only", 1],
+    ["applogs", "applogs [zeilen]", "Owner-App Logs exportieren", "Owner only", 1],
+    ["ownerpass", "ownerpass <neues_passwort>", "Owner-Login Passwort setzen", "Owner only", 1],
     ["helpadd", "helpadd <cmd> | <usage> | <nutzen> | [tipps] | [owner_only]", "Hilfeeintrag anlegen", "Owner only", 1],
     ["helpedit", "helpedit <cmd> | <usage> | <nutzen> | [tipps] | [owner_only]", "Hilfeeintrag aendern", "Owner only", 1],
     ["helpdel", "helpdel <cmd>", "Hilfeeintrag loeschen", "Owner only", 1],
@@ -434,6 +477,13 @@ export async function getUser(db, chatId) {
   return db.get("SELECT * FROM users WHERE chat_id = ?", chatId);
 }
 
+export async function getUserByProfileName(db, profileName) {
+  return db.get(
+    "SELECT * FROM users WHERE lower(profile_name) = lower(?) LIMIT 1",
+    profileName
+  );
+}
+
 export async function createUser(db, chatId, profileName, friendCode, userRole, levelRole) {
   const now = new Date().toISOString();
   await db.run(
@@ -450,6 +500,53 @@ export async function createUser(db, chatId, profileName, friendCode, userRole, 
 
 export async function setProfileName(db, chatId, profileName) {
   await db.run("UPDATE users SET profile_name = ? WHERE chat_id = ?", profileName, chatId);
+}
+
+export async function setUserProfilePhoto(db, chatId, profilePhotoUrl) {
+  await db.run(
+    "UPDATE users SET profile_photo_url = ? WHERE chat_id = ?",
+    profilePhotoUrl || null,
+    chatId
+  );
+}
+
+export async function setUserBiography(db, chatId, profileBio) {
+  await db.run(
+    "UPDATE users SET profile_bio = ? WHERE chat_id = ?",
+    profileBio || null,
+    chatId
+  );
+}
+
+export async function upsertOwnerPasswordHash(db, chatId, passwordHash, passwordSalt) {
+  const now = new Date().toISOString();
+  await db.run(
+    `INSERT INTO owner_auth (chat_id, password_hash, password_salt, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(chat_id) DO UPDATE SET
+       password_hash = excluded.password_hash,
+       password_salt = excluded.password_salt,
+       updated_at = excluded.updated_at`,
+    chatId,
+    passwordHash,
+    passwordSalt,
+    now
+  );
+}
+
+export async function getOwnerAuthByChatId(db, chatId) {
+  return db.get("SELECT * FROM owner_auth WHERE chat_id = ?", chatId);
+}
+
+export async function getOwnerAuthByUsername(db, username) {
+  return db.get(
+    `SELECT oa.*, u.profile_name, u.chat_id
+     FROM owner_auth oa
+     JOIN users u ON u.chat_id = oa.chat_id
+     WHERE lower(u.profile_name) = lower(?)
+     LIMIT 1`,
+    username
+  );
 }
 
 export async function setWalletAddress(db, chatId, walletAddress) {
@@ -714,6 +811,92 @@ export async function addOwnerAuditLog(db, actorId, command, targetId = null, pa
   );
 }
 
+export async function upsertKnownChat(db, chatId, isGroup) {
+  const now = new Date().toISOString();
+  await db.run(
+    `INSERT INTO known_chats (chat_id, is_group, last_seen_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(chat_id) DO UPDATE SET
+       is_group = excluded.is_group,
+       last_seen_at = excluded.last_seen_at`,
+    chatId,
+    isGroup ? 1 : 0,
+    now
+  );
+}
+
+export async function listKnownChats(db, groupOnly = false) {
+  if (groupOnly) {
+    return db.all("SELECT * FROM known_chats WHERE is_group = 1 ORDER BY last_seen_at DESC");
+  }
+  return db.all("SELECT * FROM known_chats ORDER BY last_seen_at DESC");
+}
+
+export async function addOwnerOutboxMessage(db, type, targetId, targetScope, message, signature, createdBy) {
+  const now = new Date().toISOString();
+  await db.run(
+    `INSERT INTO owner_outbox
+      (type, target_id, target_scope, message, signature, created_by, status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`,
+    type,
+    targetId || null,
+    targetScope || null,
+    message,
+    signature || null,
+    createdBy,
+    now
+  );
+}
+
+export async function listPendingOwnerOutbox(db, limit = 20) {
+  return db.all(
+    `SELECT * FROM owner_outbox
+     WHERE status = 'pending'
+     ORDER BY created_at ASC
+     LIMIT ?`,
+    limit
+  );
+}
+
+export async function markOwnerOutboxSent(db, id) {
+  const now = new Date().toISOString();
+  await db.run(
+    "UPDATE owner_outbox SET status = 'sent', processed_at = ?, error = NULL WHERE id = ?",
+    now,
+    id
+  );
+}
+
+export async function markOwnerOutboxFailed(db, id, errorText) {
+  const now = new Date().toISOString();
+  await db.run(
+    "UPDATE owner_outbox SET status = 'failed', processed_at = ?, error = ? WHERE id = ?",
+    now,
+    errorText || "unknown error",
+    id
+  );
+}
+
+export async function listOwnerOutbox(db, status = "all", limit = 100) {
+  const safeLimit = Math.max(1, Math.min(500, Number(limit || 100)));
+  if (status === "pending" || status === "sent" || status === "failed") {
+    return db.all(
+      `SELECT * FROM owner_outbox
+       WHERE status = ?
+       ORDER BY id DESC
+       LIMIT ?`,
+      status,
+      safeLimit
+    );
+  }
+  return db.all(
+    `SELECT * FROM owner_outbox
+     ORDER BY id DESC
+     LIMIT ?`,
+    safeLimit
+  );
+}
+
 export async function listOwnerAuditLogs(db, limit = 20) {
   return db.all(
     `SELECT * FROM owner_audit_logs ORDER BY id DESC LIMIT ?`,
@@ -857,6 +1040,10 @@ export async function listFriends(db, userId) {
      WHERE f.user_id = ?`,
     userId
   );
+}
+
+export async function listUsers(db) {
+  return db.all("SELECT * FROM users ORDER BY created_at ASC");
 }
 
 export async function listQuests(db, period) {
